@@ -1,12 +1,14 @@
 // src/screens/SettingsScreen.js
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity,
   StyleSheet, ScrollView, ActivityIndicator,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { fetchHealth, fetchStats } from '../api/kb';
-import { getChunkCount } from '../offline/db';
+import { apiFetch } from '../api/client';
+import { getChunkCount, replaceAllChunks, setSyncMeta, getAllSyncMeta } from '../offline/db';
+import { syncPdfs } from '../offline/pdfSync';
 import { colors, spacing, radius, typography, minTapTarget } from '../config/theme';
 
 export function SettingsScreen() {
@@ -17,9 +19,18 @@ export function SettingsScreen() {
   const [checking,     setChecking]     = useState(false);
   const [saveFeedback, setSaveFeedback] = useState('');
 
+  // --- Sync state ---
+  const [syncing,    setSyncing]    = useState(false);
+  const [syncResult, setSyncResult] = useState(null); // { chunks, pdfsSynced, pdfsDeleted, errors } | { error }
+  const [lastSynced, setLastSynced] = useState(null);
+
   useEffect(() => {
     AsyncStorage.getItem('server_url').then(v => { if (v) setServerUrl(v); });
     getChunkCount().then(setChunkCount).catch(() => setChunkCount(0));
+    // Load last synced time from DB sync_meta table
+    getAllSyncMeta().then(meta => {
+      if (meta.last_synced) setLastSynced(meta.last_synced);
+    }).catch(() => {});
   }, []);
 
   const saveUrl = async () => {
@@ -45,6 +56,48 @@ export function SettingsScreen() {
       setChecking(false);
     }
   };
+
+  // Manual sync handler — pulls all chunks from /kb/export and all PDFs
+  // from /documents, stores them locally for deep-offline mode.
+  const handleSync = useCallback(async () => {
+    if (syncing) return;
+    setSyncing(true);
+    setSyncResult(null);
+
+    try {
+      // 1. Fetch all chunks from the server's /kb/export endpoint
+      const res    = await apiFetch('/kb/export');
+      const data   = await res.json();
+      const chunks = data.chunks || [];
+
+      // 2. Atomically wipe + repopulate local SQLite (chunks + FTS index)
+      await replaceAllChunks(chunks);
+
+      // 3. Sync PDFs — downloads new ones, removes stale ones
+      const pdfResult = await syncPdfs();
+
+      // 4. Persist sync metadata (last_synced, chunk_count) to sync_meta table
+      const now = new Date().toISOString();
+      await setSyncMeta('last_synced', now);
+      await setSyncMeta('chunk_count', String(chunks.length));
+
+      // 5. Refresh the cached chunk count displayed in the UI
+      const count = await getChunkCount();
+      setChunkCount(count);
+      setLastSynced(now);
+
+      setSyncResult({
+        chunks:      chunks.length,
+        pdfsSynced:  pdfResult.synced.length,
+        pdfsDeleted: pdfResult.deleted.length,
+        errors:      pdfResult.errors,
+      });
+    } catch (e) {
+      setSyncResult({ error: e.message });
+    } finally {
+      setSyncing(false);
+    }
+  }, [syncing]);
 
   const healthColor =
     !health          ? colors.text3 :
@@ -128,9 +181,49 @@ export function SettingsScreen() {
             label="Cached chunks"
             value={chunkCount === null ? '…' : chunkCount.toLocaleString()}
           />
+          {lastSynced && (
+            <StatRow
+              label="Last synced"
+              value={new Date(lastSynced).toLocaleString()}
+            />
+          )}
         </View>
+
+        {/* Sync button — pulls chunks + PDFs from server into local SQLite */}
+        <TouchableOpacity
+          style={[styles.btn, styles.btnSecondary]}
+          onPress={handleSync}
+          disabled={syncing}
+          activeOpacity={0.8}
+        >
+          {syncing
+            ? <ActivityIndicator size="small" color={colors.accent} />
+            : <Text style={styles.btnTextSecondary}>⬇  Sync from Server</Text>
+          }
+        </TouchableOpacity>
+
+        {/* Sync result feedback */}
+        {syncResult && !syncResult.error && (
+          <View style={styles.healthRow}>
+            <View style={[styles.healthDot, { backgroundColor: colors.success }]} />
+            <Text style={[styles.healthLabel, { color: colors.success }]}>
+              Synced {syncResult.chunks.toLocaleString()} chunks
+              {syncResult.pdfsSynced  > 0 ? ` · ${syncResult.pdfsSynced} PDFs downloaded` : ''}
+              {syncResult.pdfsDeleted > 0 ? ` · ${syncResult.pdfsDeleted} removed`         : ''}
+            </Text>
+          </View>
+        )}
+        {syncResult?.error && (
+          <View style={styles.healthRow}>
+            <View style={[styles.healthDot, { backgroundColor: colors.error }]} />
+            <Text style={[styles.healthLabel, { color: colors.error }]}>
+              Sync failed: {syncResult.error}
+            </Text>
+          </View>
+        )}
+
         <Text style={styles.cardHint}>
-          Synced from server when reachable.
+          Synced from server when reachable.{'\n'}
           Powers local search in deep-offline mode.
         </Text>
       </View>
