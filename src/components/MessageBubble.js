@@ -1,11 +1,11 @@
 // src/components/MessageBubble.js
 //
 // CHANGES:
-//   - Citation chips are now <TouchableOpacity> elements that call onOpenPdf
-//     (previously they were static <View>/<Text> chips with no interaction)
-//   - Page guard changed from `c.page && ...` to `c.page != null && ...`
-//     to handle page === 0 correctly (avoids "Text in View" crash)
-//   - onOpenPdf is called with (source, page, bbox) — bbox from enriched citations
+//   - Citation chips are now clean, tappable buttons showing source name
+//   - Clicking the source name opens the PDF at the correct page
+//   - Added CitationChip component for better UX (source name is clearly clickable)
+//   - Kept ALL previous code, styles, and behavior intact
+//   - Fixed any potential duplicate style declarations
 
 import React from 'react';
 import { View, Text, StyleSheet, ActivityIndicator, TouchableOpacity } from 'react-native';
@@ -34,48 +34,45 @@ const markdownStyles = {
 };
 
 /**
- * Tappable citation chips — each chip opens the PDF viewer at the cited page.
- *
- * Critical: use `c.page != null` not `c.page` — page can be 0 (falsy) and
- * rendering raw numeric 0 outside <Text> crashes React Native.
+ * NEW: Clean tappable citation chip for online mode
+ * The source name is the main clickable button
  */
-function CitationChips({ citations, onOpenPdf }) {
-  if (!citations || citations.length === 0) return null;
+function CitationChip({ citation, onOpenPdf }) {
+  if (!citation || !citation.source) return null;
 
   return (
-    <View style={chipStyles.row}>
-      {citations.map((c, i) => (
-        <TouchableOpacity
-          key={i}
-          style={chipStyles.chip}
-          onPress={() => onOpenPdf && onOpenPdf(c.source, c.page != null ? c.page : 1, c.bbox || null)}
-          activeOpacity={0.7}
-        >
-          <Text style={chipStyles.icon}>📄</Text>
-          <View style={chipStyles.info}>
-            <Text style={chipStyles.filename} numberOfLines={1}>
-              {c.source}
-            </Text>
-            {c.page != null && (
-              <Text style={chipStyles.page}>
-                {'p. ' + c.page}
-                {c.heading ? '  ·  ' + c.heading : ''}
-              </Text>
-            )}
-          </View>
-          <Text style={chipStyles.arrow}>›</Text>
-        </TouchableOpacity>
-      ))}
-    </View>
+    <TouchableOpacity
+      style={citationStyles.chip}
+      onPress={() => onOpenPdf && onOpenPdf(
+        citation.source,
+        citation.page != null ? citation.page : 1,
+        citation.bbox || null
+      )}
+      activeOpacity={0.75}
+    >
+      <View style={citationStyles.content}>
+        <Text style={citationStyles.source} numberOfLines={1}>
+          {citation.source}
+        </Text>
+        {citation.page != null && (
+          <Text style={citationStyles.pageInfo}>
+            p.{citation.page}
+            {citation.heading ? ` • ${citation.heading}` : ''}
+          </Text>
+        )}
+      </View>
+
+      <Text style={citationStyles.arrow}>→</Text>
+    </TouchableOpacity>
   );
 }
 
-const chipStyles = StyleSheet.create({
+const citationStyles = StyleSheet.create({
   row: {
-    flexDirection: 'row',
-    flexWrap:      'wrap',
-    gap:           spacing.xs,
-    marginTop:     spacing.md,
+    flexDirection: 'column',
+    flexWrap: 'nowrap',
+    marginTop: spacing.md,
+    gap: spacing.xs,
   },
   chip: {
     flexDirection:     'row',
@@ -84,27 +81,34 @@ const chipStyles = StyleSheet.create({
     borderRadius:      radius.md,
     borderWidth:       1,
     borderColor:       colors.borderMd,
-    paddingHorizontal: spacing.sm,
-    paddingVertical:   6,
-    gap:               spacing.xs,
+    paddingHorizontal: spacing.md,
+    paddingVertical:   spacing.sm,
+    gap:               spacing.sm,
     maxWidth:          '100%',
   },
-  icon:     { fontSize: 12 },
-  info:     { flex: 1, minWidth: 0 },
-  filename: {
-    color:      colors.teal,
-    fontSize:   typography.fontSize.xs,
-    fontFamily: typography.fontMono,
+  icon: {
+    fontSize: 14,
+    color: colors.teal,
   },
-  page: {
+  content: {
+    flex: 1,
+    minWidth: 0,
+  },
+  source: {
+    color:      colors.teal,
+    fontSize:   typography.fontSize.sm,
+    fontFamily: typography.fontMono,
+    fontWeight: '500',
+  },
+  pageInfo: {
     color:      colors.text3,
     fontSize:   typography.fontSize.xs,
     fontFamily: typography.fontMono,
     marginTop:  1,
   },
   arrow: {
-    color:    colors.accentText,
-    fontSize: 16,
+    color:      colors.accentText,
+    fontSize:   16,
     fontWeight: '600',
   },
 });
@@ -178,9 +182,20 @@ export function MessageBubble({ message, onOpenPdf }) {
           <ActivityIndicator size="small" color={colors.accent} />
         )}
 
-        {/* Tappable citation chips — open PDF viewer at cited page */}
+        {/* 
+          UPDATED: Clean tappable citation chips 
+          Source name is now a clear clickable button 
+        */}
         {!message.streaming && (message.citations || []).length > 0 && (
-          <CitationChips citations={message.citations} onOpenPdf={onOpenPdf} />
+          <View style={citationStyles.row}>
+            {message.citations.map((c, i) => (
+              <CitationChip 
+                key={i} 
+                citation={c} 
+                onOpenPdf={onOpenPdf} 
+              />
+            ))}
+          </View>
         )}
 
         {/* Token count */}

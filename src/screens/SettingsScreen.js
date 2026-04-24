@@ -6,6 +6,8 @@
 //   - invalidateUrlCache() called after saving so next API call picks up the new URL.
 //   - handleSync uses the saved local_url (or cloud_url) for the sync request.
 //   - Sync feedback shows PDF counts.
+//   - Added runtime failover: cloud is tried first on health check, then local.
+//     If app is currently on local and cloud becomes healthy, it switches back to cloud.
 
 import React, { useState, useEffect, useCallback } from 'react';
 import {
@@ -20,29 +22,40 @@ import { syncPdfs } from '../offline/pdfSync';
 import { Config } from '../config';
 import { colors, spacing, radius, typography, minTapTarget } from '../config/theme';
 
+const normalizeUrl = (value) => (value || '').trim();
+
 export function SettingsScreen() {
   // Three-URL architecture: cloud (primary), local (fallback), legacy single URL
   const [cloudUrl,     setCloudUrl]     = useState('');
   const [localUrl,     setLocalUrl]     = useState('');
   const [health,       setHealth]       = useState(null);
   const [stats,        setStats]        = useState(null);
-  const [chunkCount,   setChunkCount]   = useState(null);
-  const [checking,     setChecking]     = useState(false);
-  const [saveFeedback, setSaveFeedback] = useState('');
+  const [chunkCount,   setChunkCount]    = useState(null);
+  const [checking,     setChecking]      = useState(false);
+  const [saveFeedback, setSaveFeedback]  = useState('');
 
   // --- Sync state ---
-  const [syncing,    setSyncing]    = useState(false);
-  const [syncResult, setSyncResult] = useState(null);
-  const [lastSynced, setLastSynced] = useState(null);
+  const [syncing,      setSyncing]      = useState(false);
+  const [syncResult,   setSyncResult]   = useState(null);
+  const [lastSynced,   setLastSynced]   = useState(null);
+
+  // Runtime-selected server URL (cloud if healthy, otherwise local)
+  const [activeUrl,    setActiveUrl]    = useState(normalizeUrl(Config.API_BASE_URL || Config.LOCAL_URL));
+  const [activeSource, setActiveSource] = useState('local');
 
   useEffect(() => {
     Promise.all([
       AsyncStorage.getItem('cloud_url'),
       AsyncStorage.getItem('local_url'),
     ]).then(([c, l]) => {
-      setCloudUrl(c || '');
-      setLocalUrl(l || Config.API_BASE_URL);
+      setCloudUrl(c || Config.CLOUD_URL);
+      setLocalUrl(l || Config.LOCAL_URL);
+
+      // Keep the base URL behavior as-is: start from the local/base server.
+      setActiveUrl(normalizeUrl(Config.API_BASE_URL || l || Config.LOCAL_URL || Config.CLOUD_URL));
+      setActiveSource('local');
     });
+
     getChunkCount().then(setChunkCount).catch(() => setChunkCount(0));
     getAllSyncMeta().then(meta => {
       if (meta.last_synced) setLastSynced(meta.last_synced);
@@ -61,23 +74,78 @@ export function SettingsScreen() {
     setTimeout(() => setSaveFeedback(''), 2000);
   };
 
-  // Determine the best URL to use for health check and sync
+  const probeUrl = useCallback(async (url) => {
+    const target = normalizeUrl(url);
+    if (!target) return false;
+
+    try {
+      const h = await fetchHealth(null, target);
+      return Boolean(h && !h.error && h.is_online !== false);
+    } catch {
+      return false;
+    }
+  }, []);
+
+  // Cloud first, then local, then configured fallback
+  const resolvePreferredUrl = useCallback(async () => {
+    const cloud = normalizeUrl(cloudUrl || Config.CLOUD_URL);
+    const local = normalizeUrl(localUrl || Config.LOCAL_URL);
+    const fallback = normalizeUrl(Config.API_BASE_URL || Config.LOCAL_URL || local || cloud);
+
+    if (await probeUrl(cloud)) {
+      return { url: cloud, source: 'cloud' };
+    }
+
+    if (await probeUrl(local)) {
+      return { url: local, source: 'local' };
+    }
+
+    return { url: fallback, source: 'fallback' };
+  }, [cloudUrl, localUrl, probeUrl]);
+
+  // Resolve and update runtime URL if needed.
+  // This keeps the current base/local default, but allows switching to cloud when healthy.
+  const syncRuntimeUrl = useCallback(async () => {
+    const resolved = await resolvePreferredUrl();
+
+    if (resolved.url && resolved.url !== activeUrl) {
+      setActiveUrl(resolved.url);
+      setActiveSource(resolved.source);
+
+      // Keep old code paths working
+      await AsyncStorage.setItem('server_url', resolved.url);
+      invalidateUrlCache();
+    }
+
+    return resolved;
+  }, [resolvePreferredUrl, activeUrl]);
+
+  // Determine the current runtime URL (default remains local/base)
   const getActiveUrl = useCallback(() => {
-    return cloudUrl.trim() || localUrl.trim() || Config.API_BASE_URL;
-  }, [cloudUrl, localUrl]);
+    return activeUrl || normalizeUrl(Config.API_BASE_URL || Config.LOCAL_URL || localUrl || cloudUrl);
+  }, [activeUrl, localUrl, cloudUrl]);
 
   const checkHealth = async () => {
     setChecking(true);
     setHealth(null);
     setStats(null);
     try {
-      const url = getActiveUrl();
+      // Try cloud first; if cloud is unavailable, fall back to local.
+      // If we are currently on local and cloud is healthy again, this switches back to cloud.
+      const resolved = await syncRuntimeUrl();
+      const url = resolved.url;
+
       const [h, s] = await Promise.all([
         fetchHealth(null, url),
         fetchStats(url).catch(() => null),
       ]);
+
       setHealth(h);
       setStats(s);
+
+      // Make the runtime selection visible to the rest of the screen/app
+      setActiveUrl(url);
+      setActiveSource(resolved.source);
     } catch (e) {
       setHealth({ error: e.message });
     } finally {
@@ -91,9 +159,11 @@ export function SettingsScreen() {
     setSyncing(true);
     setSyncResult(null);
 
-    const activeUrl = getActiveUrl();
-
     try {
+      // Re-evaluate before syncing so the app can move back to cloud if it is healthy again.
+      const resolved = await syncRuntimeUrl();
+      const activeUrl = resolved.url || getActiveUrl();
+
       // 1. Fetch all chunks from /kb/export
       const res    = await apiFetch('/kb/export', activeUrl);
       const data   = await res.json();
@@ -126,7 +196,7 @@ export function SettingsScreen() {
     } finally {
       setSyncing(false);
     }
-  }, [syncing, getActiveUrl]);
+  }, [syncing, syncRuntimeUrl, getActiveUrl]);
 
   const healthColor =
     !health          ? colors.text3 :
@@ -152,7 +222,7 @@ export function SettingsScreen() {
       <View style={styles.card}>
         <Text style={styles.cardTitle}>Server URLs</Text>
         <Text style={styles.cardHint}>
-          Cloud URL (primary — Mode 1 with internet, Mode 2 without):{'\\n'}
+          Cloud URL (primary — Mode 1 with internet, Mode 2 without):{'\n'}
           Leave blank if only using a local server.
         </Text>
         <TextInput
@@ -167,7 +237,7 @@ export function SettingsScreen() {
         />
 
         <Text style={[styles.cardHint, { marginTop: spacing.xs }]}>
-          Local URL (fallback — used when cloud is unreachable):{'\\n'}
+          Local URL (fallback — used when cloud is unreachable):{'\n'}
           Android emulator: http://10.0.2.2:8000
         </Text>
         <TextInput
@@ -268,7 +338,7 @@ export function SettingsScreen() {
         )}
 
         <Text style={styles.cardHint}>
-          Synced automatically when server becomes reachable.{'\\n'}
+          Synced automatically when server becomes reachable.{'\n'}
           Powers local search in deep-offline mode.
         </Text>
       </View>
@@ -277,9 +347,9 @@ export function SettingsScreen() {
       <View style={styles.card}>
         <Text style={styles.cardTitle}>About</Text>
         <Text style={styles.aboutText}>
-          MarineDoc v1.0  ·  Hybrid RAG Ship Manual Assistant{'\\n\\n'}
-          Mode 1 — Online: AI-powered answers (Groq){'\\n'}
-          Mode 2 — At Sea: Manual section retrieval{'\\n'}
+          MarineDoc v1.0  ·  Hybrid RAG Ship Manual Assistant{'\n\n'}
+          Mode 1 — Online: AI-powered answers (Groq){'\n'}
+          Mode 2 — At Sea: Manual section retrieval{'\n'}
           Mode 3 — Offline: Local SQLite full-text search
         </Text>
       </View>
