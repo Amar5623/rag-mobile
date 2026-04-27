@@ -1,4 +1,14 @@
 // src/screens/SettingsScreen.js
+//
+// CHANGES:
+//   - Added `cloud_url` and `local_url` fields (three-URL architecture).
+//     Legacy `server_url` is still saved for backward compatibility.
+//   - invalidateUrlCache() called after saving so next API call picks up the new URL.
+//   - handleSync uses the saved local_url (or cloud_url) for the sync request.
+//   - Sync feedback shows PDF counts.
+//   - Added runtime failover: cloud is tried first on health check, then local.
+//     If app is currently on local and cloud becomes healthy, it switches back to cloud.
+
 import React, { useState, useEffect, useCallback } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity,
@@ -6,50 +16,136 @@ import {
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { fetchHealth, fetchStats } from '../api/kb';
-import { apiFetch } from '../api/client';
+import { apiFetch, invalidateUrlCache } from '../api/client';
 import { getChunkCount, replaceAllChunks, setSyncMeta, getAllSyncMeta } from '../offline/db';
 import { syncPdfs } from '../offline/pdfSync';
+import { Config } from '../config';
 import { colors, spacing, radius, typography, minTapTarget } from '../config/theme';
 
+const normalizeUrl = (value) => (value || '').trim();
+
 export function SettingsScreen() {
-  const [serverUrl,    setServerUrl]    = useState('');
+  // Three-URL architecture: cloud (primary), local (fallback), legacy single URL
+  const [cloudUrl,     setCloudUrl]     = useState('');
+  const [localUrl,     setLocalUrl]     = useState('');
   const [health,       setHealth]       = useState(null);
   const [stats,        setStats]        = useState(null);
-  const [chunkCount,   setChunkCount]   = useState(null);
-  const [checking,     setChecking]     = useState(false);
-  const [saveFeedback, setSaveFeedback] = useState('');
+  const [chunkCount,   setChunkCount]    = useState(null);
+  const [checking,     setChecking]      = useState(false);
+  const [saveFeedback, setSaveFeedback]  = useState('');
 
   // --- Sync state ---
-  const [syncing,    setSyncing]    = useState(false);
-  const [syncResult, setSyncResult] = useState(null); // { chunks, pdfsSynced, pdfsDeleted, errors } | { error }
-  const [lastSynced, setLastSynced] = useState(null);
+  const [syncing,      setSyncing]      = useState(false);
+  const [syncResult,   setSyncResult]   = useState(null);
+  const [lastSynced,   setLastSynced]   = useState(null);
+
+  // Runtime-selected server URL (cloud if healthy, otherwise local)
+  const [activeUrl,    setActiveUrl]    = useState(normalizeUrl(Config.API_BASE_URL || Config.LOCAL_URL));
+  const [activeSource, setActiveSource] = useState('local');
 
   useEffect(() => {
-    AsyncStorage.getItem('server_url').then(v => { if (v) setServerUrl(v); });
+    Promise.all([
+      AsyncStorage.getItem('cloud_url'),
+      AsyncStorage.getItem('local_url'),
+    ]).then(([c, l]) => {
+      setCloudUrl(c || Config.CLOUD_URL);
+      setLocalUrl(l || Config.LOCAL_URL);
+
+      // Keep the base URL behavior as-is: start from the local/base server.
+      setActiveUrl(normalizeUrl(Config.API_BASE_URL || l || Config.LOCAL_URL || Config.CLOUD_URL));
+      setActiveSource('local');
+    });
+
     getChunkCount().then(setChunkCount).catch(() => setChunkCount(0));
-    // Load last synced time from DB sync_meta table
     getAllSyncMeta().then(meta => {
       if (meta.last_synced) setLastSynced(meta.last_synced);
     }).catch(() => {});
   }, []);
 
-  const saveUrl = async () => {
-    await AsyncStorage.setItem('server_url', serverUrl.trim());
+  const saveUrls = async () => {
+    await Promise.all([
+      AsyncStorage.setItem('cloud_url', cloudUrl.trim()),
+      AsyncStorage.setItem('local_url', localUrl.trim()),
+      // Keep legacy key in sync so old code paths still work
+      AsyncStorage.setItem('server_url', (localUrl.trim() || cloudUrl.trim())),
+    ]);
+    invalidateUrlCache(); // force client.js to re-read on next request
     setSaveFeedback('Saved ✓');
     setTimeout(() => setSaveFeedback(''), 2000);
   };
+
+  const probeUrl = useCallback(async (url) => {
+    const target = normalizeUrl(url);
+    if (!target) return false;
+
+    try {
+      const h = await fetchHealth(null, target);
+      return Boolean(h && !h.error && h.is_online !== false);
+    } catch {
+      return false;
+    }
+  }, []);
+
+  // Cloud first, then local, then configured fallback
+  const resolvePreferredUrl = useCallback(async () => {
+    const cloud = normalizeUrl(cloudUrl || Config.CLOUD_URL);
+    const local = normalizeUrl(localUrl || Config.LOCAL_URL);
+    const fallback = normalizeUrl(Config.API_BASE_URL || Config.LOCAL_URL || local || cloud);
+
+    if (await probeUrl(cloud)) {
+      return { url: cloud, source: 'cloud' };
+    }
+
+    if (await probeUrl(local)) {
+      return { url: local, source: 'local' };
+    }
+
+    return { url: fallback, source: 'fallback' };
+  }, [cloudUrl, localUrl, probeUrl]);
+
+  // Resolve and update runtime URL if needed.
+  // This keeps the current base/local default, but allows switching to cloud when healthy.
+  const syncRuntimeUrl = useCallback(async () => {
+    const resolved = await resolvePreferredUrl();
+
+    if (resolved.url && resolved.url !== activeUrl) {
+      setActiveUrl(resolved.url);
+      setActiveSource(resolved.source);
+
+      // Keep old code paths working
+      await AsyncStorage.setItem('server_url', resolved.url);
+      invalidateUrlCache();
+    }
+
+    return resolved;
+  }, [resolvePreferredUrl, activeUrl]);
+
+  // Determine the current runtime URL (default remains local/base)
+  const getActiveUrl = useCallback(() => {
+    return activeUrl || normalizeUrl(Config.API_BASE_URL || Config.LOCAL_URL || localUrl || cloudUrl);
+  }, [activeUrl, localUrl, cloudUrl]);
 
   const checkHealth = async () => {
     setChecking(true);
     setHealth(null);
     setStats(null);
     try {
+      // Try cloud first; if cloud is unavailable, fall back to local.
+      // If we are currently on local and cloud is healthy again, this switches back to cloud.
+      const resolved = await syncRuntimeUrl();
+      const url = resolved.url;
+
       const [h, s] = await Promise.all([
-        fetchHealth(),
-        fetchStats().catch(() => null),
+        fetchHealth(null, url),
+        fetchStats(url).catch(() => null),
       ]);
+
       setHealth(h);
       setStats(s);
+
+      // Make the runtime selection visible to the rest of the screen/app
+      setActiveUrl(url);
+      setActiveSource(resolved.source);
     } catch (e) {
       setHealth({ error: e.message });
     } finally {
@@ -58,15 +154,18 @@ export function SettingsScreen() {
   };
 
   // Manual sync handler — pulls all chunks from /kb/export and all PDFs
-  // from /documents, stores them locally for deep-offline mode.
   const handleSync = useCallback(async () => {
     if (syncing) return;
     setSyncing(true);
     setSyncResult(null);
 
     try {
-      // 1. Fetch all chunks from the server's /kb/export endpoint
-      const res    = await apiFetch('/kb/export');
+      // Re-evaluate before syncing so the app can move back to cloud if it is healthy again.
+      const resolved = await syncRuntimeUrl();
+      const activeUrl = resolved.url || getActiveUrl();
+
+      // 1. Fetch all chunks from /kb/export
+      const res    = await apiFetch('/kb/export', activeUrl);
       const data   = await res.json();
       const chunks = data.chunks || [];
 
@@ -74,14 +173,14 @@ export function SettingsScreen() {
       await replaceAllChunks(chunks);
 
       // 3. Sync PDFs — downloads new ones, removes stale ones
-      const pdfResult = await syncPdfs();
+      const pdfResult = await syncPdfs(activeUrl);
 
-      // 4. Persist sync metadata (last_synced, chunk_count) to sync_meta table
+      // 4. Persist sync metadata
       const now = new Date().toISOString();
       await setSyncMeta('last_synced', now);
       await setSyncMeta('chunk_count', String(chunks.length));
 
-      // 5. Refresh the cached chunk count displayed in the UI
+      // 5. Refresh displayed chunk count
       const count = await getChunkCount();
       setChunkCount(count);
       setLastSynced(now);
@@ -97,7 +196,7 @@ export function SettingsScreen() {
     } finally {
       setSyncing(false);
     }
-  }, [syncing]);
+  }, [syncing, syncRuntimeUrl, getActiveUrl]);
 
   const healthColor =
     !health          ? colors.text3 :
@@ -119,25 +218,41 @@ export function SettingsScreen() {
     >
       <Text style={styles.heading}>Settings</Text>
 
-      {/* ── Server URL ── */}
+      {/* ── Server URLs ── */}
       <View style={styles.card}>
-        <Text style={styles.cardTitle}>Server URL</Text>
+        <Text style={styles.cardTitle}>Server URLs</Text>
         <Text style={styles.cardHint}>
-          IP address of the FastAPI backend on your LAN.{'\n'}
+          Cloud URL (primary — Mode 1 with internet, Mode 2 without):{'\n'}
+          Leave blank if only using a local server.
+        </Text>
+        <TextInput
+          style={styles.input}
+          value={cloudUrl}
+          onChangeText={setCloudUrl}
+          placeholder="http://192.168.1.10:8001  (optional)"
+          placeholderTextColor={colors.text3}
+          autoCapitalize="none"
+          autoCorrect={false}
+          keyboardType="url"
+        />
+
+        <Text style={[styles.cardHint, { marginTop: spacing.xs }]}>
+          Local URL (fallback — used when cloud is unreachable):{'\n'}
           Android emulator: http://10.0.2.2:8000
         </Text>
         <TextInput
           style={styles.input}
-          value={serverUrl}
-          onChangeText={setServerUrl}
+          value={localUrl}
+          onChangeText={setLocalUrl}
           placeholder="http://192.168.1.10:8000"
           placeholderTextColor={colors.text3}
           autoCapitalize="none"
           autoCorrect={false}
           keyboardType="url"
         />
-        <TouchableOpacity style={styles.btn} onPress={saveUrl} activeOpacity={0.8}>
-          <Text style={styles.btnText}>{saveFeedback || 'Save URL'}</Text>
+
+        <TouchableOpacity style={styles.btn} onPress={saveUrls} activeOpacity={0.8}>
+          <Text style={styles.btnText}>{saveFeedback || 'Save URLs'}</Text>
         </TouchableOpacity>
       </View>
 
@@ -223,7 +338,7 @@ export function SettingsScreen() {
         )}
 
         <Text style={styles.cardHint}>
-          Synced from server when reachable.{'\n'}
+          Synced automatically when server becomes reachable.{'\n'}
           Powers local search in deep-offline mode.
         </Text>
       </View>
