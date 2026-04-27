@@ -16,6 +16,7 @@
       "expo-dev-client",
       "expo-sqlite",
       "./plugins/withSqliteVec",
+      "./plugins/withOnnxRuntime",
       [
         "expo-build-properties",
         {
