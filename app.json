@@ -3,6 +3,7 @@
     "name": "rag-mobile",
     "slug": "rag-mobile",
     "version": "1.0.0",
+    "assetBundlePatterns": ["assets/models/**"],
     "extra": {
       "eas": { "projectId": "3df568cc-8bca-4f72-8ce6-17cbdc5d68b6" }
     },
@@ -19,7 +20,6 @@
     ],
     "android": {
       "package": "com.ragmobile"
-    },
-    "assets": ["./assets/models/"]
+    }
   }
 }
