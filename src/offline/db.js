@@ -1,48 +1,23 @@
-// src/offline/db.js  — P2 + P3 + P4 + FIX-VECTORS + FIX-UNIQUE + SEARCH-MODE-LOGGING
+// src/offline/db.js  — P2 + P3 + P4 + FIX-VECTORS + FIX-UNIQUE + SEARCH-MODE-LOGGING + FIX-TRANSACTION
 //
 // CHANGES FROM PREVIOUS VERSION:
 //
-//   FIX — 338/340 vectors: vec0 UNIQUE constraint failure on duplicate content-hash chunks.
+//   FIX — "cannot start a transaction within a transaction"
 //     PROBLEM:
-//       Two BM25 chunks produce the same _content_hash (identical source + page +
-//       content[:80] prefix). `INSERT OR REPLACE INTO vec_chunks` is not supported
-//       by sqlite-vec's vec0 virtual table — it throws UNIQUE constraint failed
-//       instead of silently replacing, so 2 inserts failed every sync.
-//       Qdrant has the same 338 unique vectors (it deduped silently), which is
-//       why the server also shows 338 rather than 340.
+//       expo-sqlite's withTransactionAsync() calls execAsync('BEGIN') internally.
+//       execAsync() cannot be called while any transaction is already open on the
+//       same database connection. When two sync triggers fire close together at
+//       startup (Effect 1 + Effect 2 in useOfflineSearch both fire), the second
+//       call to replaceAllChunksWithVectors() arrives while the first transaction
+//       is still open, and the nested execAsync('BEGIN') throws.
 //     FIX:
-//       Use `INSERT OR IGNORE INTO vec_chunks` — duplicate IDs are silently
-//       skipped rather than erroring. The first chunk with that hash wins,
-//       which is consistent with Qdrant's behaviour.
-//       Also: deduplicate chunk IDs BEFORE the insert loop so the chunks table
-//       and FTS don't get spurious duplicates either.
+//       Replace every withTransactionAsync() call with manual
+//       BEGIN / COMMIT / ROLLBACK using runAsync(), which does not call
+//       execAsync() and is safe to use without the nested-transaction restriction.
+//       A try/catch wraps the entire block so ROLLBACK always fires on error,
+//       leaving the DB in a clean state for the next operation.
 //
-//   FIX — Embedder unavailable / BM25-only offline mode.
-//     PROBLEM:
-//       `Cannot read property 'install' of null` — sqlite-vec native module
-//       is not accessible in the ONNX worker thread when getEmbedder() is called.
-//       The expo-file-system deprecation warning fires during module init and
-//       its text becomes the caught error message, masking the real cause.
-//     FIX:
-//       hybridSearchChunks() accepts a pre-computed queryVec (Float32Array) or
-//       null — no change needed here. The embedder issue is in embedder.js.
-//       Added a guard: if queryVec is provided but has wrong length, log and
-//       discard rather than passing a malformed blob to vec0.
-//
-//   NEW — Search mode metadata on every hybridSearchChunks call.
-//     hybridSearchChunks now:
-//       1. Logs a one-line summary showing which paths ran and how many
-//          candidates each produced, e.g.:
-//          [DB] Search: BM25=12 KNN=15 → hybrid RRF → top 5
-//          [DB] Search: BM25=8 KNN=0 → BM25-only → top 5
-//       2. Returns a _searchMode field on each result chunk:
-//          "hybrid"   — both BM25 and KNN contributed
-//          "bm25"     — BM25 only (no embedder or KNN returned empty)
-//          "knn"      — KNN only (BM25 returned empty, rare)
-//       This makes it trivially testable: log result[0]._searchMode in useChat.
-//
-//   KEPT — All other P2/P3/P4 logic (toVecBlob, schema, RRF, fallback search,
-//           singleton guard, WAL, FTS5 BM25, getVectorCount, sync metadata).
+//   KEPT — All other P2/P3/P4/FIX-VECTORS/FIX-UNIQUE/SEARCH-MODE-LOGGING logic.
 
 import * as SQLite     from 'expo-sqlite';
 import * as FileSystem from 'expo-file-system/legacy';
@@ -151,6 +126,12 @@ async function _initDb() {
 /**
  * Atomically replace ALL stored chunks, FTS index, AND vector embeddings.
  *
+ * FIX: Uses manual BEGIN/COMMIT/ROLLBACK via runAsync() instead of
+ * withTransactionAsync(). withTransactionAsync() calls execAsync('BEGIN')
+ * internally, which throws "cannot start a transaction within a transaction"
+ * when two sync triggers overlap at startup. runAsync('BEGIN') does not
+ * have this restriction.
+ *
  * @param {Array} chunks — chunk objects from /kb/export (with .embedding field)
  */
 export async function replaceAllChunksWithVectors(chunks) {
@@ -159,11 +140,7 @@ export async function replaceAllChunksWithVectors(chunks) {
   let vectorErrors      = 0;
   let duplicatesSkipped = 0;
 
-  // FIX: Deduplicate by id BEFORE the transaction.
-  // Two BM25 chunks can produce identical _content_hash IDs (same source+page+content[:80]).
-  // vec0's INSERT OR IGNORE silently skips duplicates; but the chunks table uses
-  // PRIMARY KEY so INSERT OR REPLACE overwrites — deduplicate once here so both
-  // tables see the same unique rows.
+  // Deduplicate by id BEFORE the transaction.
   const seen   = new Set();
   const unique = [];
   for (const c of chunks) {
@@ -181,7 +158,11 @@ export async function replaceAllChunksWithVectors(chunks) {
     console.warn(`[DB] Deduplication: ${duplicatesSkipped} duplicate chunk(s) dropped before insert`);
   }
 
-  await db.withTransactionAsync(async () => {
+  // FIX: manual transaction — runAsync('BEGIN') is safe even when another
+  // async operation is in flight; withTransactionAsync/execAsync('BEGIN') is not.
+  try {
+    await db.runAsync('BEGIN;');
+
     await db.runAsync('DELETE FROM chunks;');
     await db.runAsync('DELETE FROM chunks_fts;');
     try {
@@ -234,10 +215,8 @@ export async function replaceAllChunksWithVectors(chunks) {
       try {
         const blob = toVecBlob(c.embedding);
 
-        // FIX: INSERT OR IGNORE instead of INSERT OR REPLACE.
-        // vec0 virtual table does not support ON CONFLICT replacement —
-        // it throws UNIQUE constraint failed. OR IGNORE silently skips
-        // the duplicate, which is correct since we already deduped above.
+        // INSERT OR IGNORE — vec0 virtual table does not support ON CONFLICT
+        // replacement; OR IGNORE silently skips duplicates (already deduped above).
         await db.runAsync(
           'INSERT OR IGNORE INTO vec_chunks (id, embedding) VALUES (?, ?)',
           [id, blob],
@@ -248,7 +227,15 @@ export async function replaceAllChunksWithVectors(chunks) {
         vectorErrors++;
       }
     }
-  });
+
+    await db.runAsync('COMMIT;');
+
+  } catch (err) {
+    // Always roll back on any error so the DB is never left in a
+    // partial-transaction state that would block all future operations.
+    try { await db.runAsync('ROLLBACK;'); } catch (_) { /* ignore rollback errors */ }
+    throw err;
+  }
 
   if (vectorErrors > 0) {
     console.warn(
@@ -291,12 +278,12 @@ function rrfMerge(resultLists, topK) {
 /**
  * Hybrid search: BM25 (FTS5) + Semantic KNN (sqlite-vec) → RRF merge.
  *
- * NEW: Every result now carries a _searchMode field:
+ * Every result carries a _searchMode field:
  *   "hybrid" — both BM25 and KNN contributed via RRF
  *   "bm25"   — BM25 only (embedder unavailable or KNN returned empty)
  *   "knn"    — KNN only (BM25 returned empty, very rare)
  *
- * A one-line summary is always logged so you can see which path was taken:
+ * A one-line summary is always logged:
  *   [DB] Search: BM25=12 KNN=15 → hybrid RRF → top 5
  *   [DB] Search: BM25=8 KNN=0 → bm25-only → top 5
  *
@@ -346,8 +333,6 @@ export async function hybridSearchChunks(query, queryVec = null, topK = 5, candi
   let vecResults = [];
 
   if (queryVec) {
-    // Guard: wrong dimension means toVecBlob will produce a bad blob that
-    // vec0 will reject with a confusing error — catch it early with a clear message.
     const vecLen = queryVec.length ?? queryVec.byteLength / 4;
     if (vecLen !== 384) {
       console.warn(`[DB] KNN skipped — queryVec has wrong length: ${vecLen} (expected 384)`);
@@ -387,7 +372,6 @@ export async function hybridSearchChunks(query, queryVec = null, topK = 5, candi
             });
         }
       } catch (e) {
-        // Distinguish "extension not loaded" (expected) from real query errors.
         console.warn('[DB] KNN search failed:', e.message);
       }
     }
@@ -403,8 +387,6 @@ export async function hybridSearchChunks(query, queryVec = null, topK = 5, candi
   else if (!hasBM25 && hasKNN) searchMode = 'knn';
   else                          searchMode = 'empty';
 
-  // NEW: always-printed one-liner — tells you at a glance which path ran.
-  // Look for this in Metro logs after every offline query.
   console.log(
     `[DB] Search: BM25=${bm25Results.length} KNN=${vecResults.length} ` +
     `→ ${searchMode === 'hybrid' ? 'hybrid RRF' : searchMode + '-only'} → top ${topK}` +
@@ -425,8 +407,6 @@ export async function hybridSearchChunks(query, queryVec = null, topK = 5, candi
     merged = rrfMerge(sources, topK);
   }
 
-  // NEW: attach _searchMode to every returned chunk.
-  // In useChat.js you can verify with: console.log(results[0]?._searchMode)
   return merged.map(c => ({ ...c, _searchMode: searchMode }));
 }
 
@@ -491,7 +471,9 @@ export async function isPdfAvailableLocally(filename) {
 
 export async function clearChunks() {
   const db = await getDb();
-  await db.withTransactionAsync(async () => {
+  // FIX: manual transaction — same reason as replaceAllChunksWithVectors above
+  try {
+    await db.runAsync('BEGIN;');
     await db.runAsync('DELETE FROM chunks;');
     await db.runAsync('DELETE FROM chunks_fts;');
     try {
@@ -499,7 +481,11 @@ export async function clearChunks() {
     } catch (e) {
       console.warn('[DB] clearChunks: vec_chunks clear skipped:', e.message);
     }
-  });
+    await db.runAsync('COMMIT;');
+  } catch (err) {
+    try { await db.runAsync('ROLLBACK;'); } catch (_) { /* ignore */ }
+    throw err;
+  }
   console.log('[DB] Local chunks cleared');
 }
 
