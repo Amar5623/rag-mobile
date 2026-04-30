@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
+    "eas-build-pre-install": "bash .eas/build/pre-install.sh",
     "start": "NODE_OPTIONS=--max-old-space-size=4096 expo start",
     "start:dev": "NODE_OPTIONS=--max-old-space-size=4096 expo start --dev-client",
     "android": "NODE_OPTIONS=--max-old-space-size=4096 expo run:android",
