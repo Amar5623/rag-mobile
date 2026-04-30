@@ -13,6 +13,7 @@
     },
     "plugins": [
       "./plugins/withModelAssets",
+      "./plugins/withOnnxRuntime",
       "expo-secure-store",
       "expo-dev-client",
       "expo-sqlite",
@@ -22,9 +23,6 @@
         {
           "android": {
             "extraMavenRepos": ["https://repo1.maven.org/maven2/"],
-            "extraGradleDependencies": [
-              "com.microsoft.onnxruntime:onnxruntime-android:1.18.0"
-            ],
             "extraProguardRules": "-keep class ai.onnxruntime.** { *; }"
           }
         }
