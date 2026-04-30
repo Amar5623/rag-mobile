@@ -3,13 +3,9 @@
     "name": "rag-mobile",
     "slug": "rag-mobile",
     "version": "1.0.0",
-    "assetBundlePatterns": [
-      "assets/models/**"
-    ],
+    "assetBundlePatterns": ["assets/models/**"],
     "extra": {
-      "eas": {
-        "projectId": "3bc2d6d8-bac0-4689-a3b5-7e31f74417d5"
-      }
+      "eas": { "projectId": "3bc2d6d8-bac0-4689-a3b5-7e31f74417d5" }
     },
     "plugins": [
       "./plugins/withModelAssets",
@@ -22,6 +18,7 @@
         "expo-build-properties",
         {
           "android": {
+            "newArchEnabled": false,
             "extraMavenRepos": ["https://repo1.maven.org/maven2/"],
             "extraProguardRules": "-keep class ai.onnxruntime.** { *; }"
           }
