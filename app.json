@@ -12,6 +12,7 @@
       }
     },
     "plugins": [
+      "./plugins/withModelAssets",
       "expo-secure-store",
       "expo-dev-client",
       "expo-sqlite",

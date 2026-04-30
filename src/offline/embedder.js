@@ -77,13 +77,17 @@ let _sessionInit = null;
 let _ort         = null;  // FIX 4: store ORT module reference at init time
 
 async function _getModelPath() {
-  const [asset] = await Asset.loadAsync(
-    require('../../assets/models/bge-small.onnx')
-  );
+  // The file is now placed in the APK's root assets/ folder by withModelAssets plugin.
+  // We can copy it to the cache directory using FileSystem.
+  const assetUri = 'asset:///models/bge-small.onnx';  // points to assets/models/bge-small.onnx
   const dest = `${FileSystem.cacheDirectory}bge-small.onnx`;
   const info = await FileSystem.getInfoAsync(dest);
   if (!info.exists) {
-    await FileSystem.copyAsync({ from: asset.localUri, to: dest });
+    // Download/copy the asset to the cache dir
+    await FileSystem.copyAsync({
+      from: assetUri,
+      to: dest,
+    });
   }
   return dest;
 }
