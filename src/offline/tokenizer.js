@@ -11,8 +11,9 @@
 //     tokenizer.json         (~760 KB)
 //     tokenizer_config.json  (~1 KB)
 //
-//   Register in metro.config.js:
-//     config.resolver.assetExts.push('onnx', 'json');
+//   The withModelAssets config plugin (plugins/withModelAssets.js) copies
+//   vocab.txt into the Android APK's assets/models/ folder at build time.
+//   This module loads it via FileSystem from 'asset:///models/vocab.txt'.
 //
 // VERIFICATION (run after P0, before P1):
 //   const serverVec = await apiFetch('/embed', url, { method:'POST', body: JSON.stringify({ text:'hello world' }) }).then(r=>r.json());
@@ -21,7 +22,6 @@
 //   assert(sim > 0.99, `Tokenizer mismatch! sim=${sim}`);
 
 import * as FileSystem from 'expo-file-system/legacy';
-import { Asset }       from 'expo-asset';
 
 // ── Special token IDs (standard BERT / bge-small values) ──────────────────
 const UNK_ID = 100;  // [UNK]
@@ -35,23 +35,19 @@ let _vocab     = null;   // Map<string, number>
 let _vocabInit = null;   // Promise — ensures loadVocab() runs exactly once
 
 /**
- * Load vocab.txt from the bundled asset into a Map<token, id>.
+ * Load vocab.txt from the native assets folder into a Map<token, id>.
  * Subsequent calls return the same promise (singleton pattern).
  */
 async function loadVocab() {
   if (_vocabInit) return _vocabInit;
 
   _vocabInit = (async () => {
-    // expo-asset resolves the bundled file to a content:// / file:// URI
-    const [asset] = await Asset.loadAsync(
-      require('../../assets/models/vocab.txt')
-    );
-
-    // Copy to cache dir where FileSystem.readAsStringAsync works on both platforms
+    // The file is copied to the APK's assets/models/ by withModelAssets plugin.
+    const assetUri = 'asset:///models/vocab.txt';
     const dest = FileSystem.cacheDirectory + 'bge-vocab.txt';
     const info = await FileSystem.getInfoAsync(dest);
     if (!info.exists) {
-      await FileSystem.copyAsync({ from: asset.localUri, to: dest });
+      await FileSystem.copyAsync({ from: assetUri, to: dest });
     }
 
     const text = await FileSystem.readAsStringAsync(dest);
