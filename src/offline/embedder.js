@@ -60,7 +60,7 @@ import { Platform, NativeModules } from 'react-native';  // FIX 4: need NativeMo
 import * as FileSystem from 'expo-file-system/legacy';   // FIX 1: use legacy API
 import { Asset }       from 'expo-asset';
 import { tokenize }    from './tokenizer';               // FIX 3: real WordPiece
-import { TurboModuleRegistry } from 'react-native';
+// import { TurboModuleRegistry } from 'react-native';
 // ─────────────────────────────────────────────────────────────
 // CONSTANTS
 // ─────────────────────────────────────────────────────────────
@@ -108,9 +108,7 @@ async function _getModelPath() {
  * 'install' of null". We catch this before it happens.
  */
 async function _importORT() {
-  // FIX 4: synchronous pre-flight — no import needed to check this
-  const _OrtModule = TurboModuleRegistry.get('Onnxruntime') ?? NativeModules.Onnxruntime;
-  if (!_OrtModule) {
+  if (!NativeModules.Onnxruntime) {
     throw new Error(
       'NativeModules.Onnxruntime is null — the onnxruntime-react-native native ' +
       'module was not compiled into this build. ' +
