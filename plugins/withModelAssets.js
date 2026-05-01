@@ -17,8 +17,9 @@ module.exports = function withModelAssets(config) {
         'models'
       );
 
-      const modelSrc = path.join(projectRoot, 'assets', 'models', 'bge-small.onnx');
-      const vocabSrc = path.join(projectRoot, 'assets', 'models', 'vocab.txt');
+      const modelSrc    = path.join(projectRoot, 'assets', 'models', 'bge-small.onnx');
+      const vocabSrc    = path.join(projectRoot, 'assets', 'models', 'vocab.txt');
+      const rerankerSrc = path.join(projectRoot, 'assets', 'models', 'reranker.onnx');
 
       fs.mkdirSync(destDir, { recursive: true });
 
@@ -34,6 +35,13 @@ module.exports = function withModelAssets(config) {
         console.log('[withModelAssets] ✅ Copied vocab.txt to native assets');
       } else {
         console.warn('[withModelAssets] ⚠️ vocab.txt not found at', vocabSrc);
+      }
+
+      if (fs.existsSync(rerankerSrc)) {
+        fs.copyFileSync(rerankerSrc, path.join(destDir, 'reranker.onnx'));
+        console.log('[withModelAssets] ✅ Copied reranker.onnx to native assets');
+      } else {
+        console.warn('[withModelAssets] ⚠️ reranker.onnx not found at', rerankerSrc);
       }
 
       return cfg;
