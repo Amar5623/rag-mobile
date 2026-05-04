@@ -27,17 +27,31 @@ if [ "$FILE_SIZE" -lt 10000000 ]; then
   exit 1
 fi
 
-# ── Download reranker.onnx (full float32, ~85MB) ─────────────────
+# ── Download correct FP32 non-quantized cross‑encoder ONNX ─────
+RERANKER_PATH="assets/models/reranker.onnx"
+RERANKER_ZIP="assets/models/ms-marco-MiniLM-L-6-v2-onnx.zip"
+RERANKER_TEMP="assets/models/_reranker_extract"
+
 if [ ! -f "$RERANKER_PATH" ]; then
-  echo "[pre-install] Downloading reranker.onnx (~85MB) from HuggingFace..."
-  mkdir -p "$MODEL_DIR"
-  curl -L \
-    --retry 3 \
-    --retry-delay 5 \
-    --progress-bar \
-    "https://huggingface.co/Xenova/ms-marco-MiniLM-L-6-v2/resolve/main/onnx/model.onnx" \
-    -o "$RERANKER_PATH"
-  echo "[pre-install] ✅ Reranker downloaded: $(du -sh $RERANKER_PATH | cut -f1)"
+  echo "[pre-install] Downloading correct reranker ONNX (FP32, ~83MB)..."
+  mkdir -p "$MODEL_DIR" "$RERANKER_TEMP"
+
+  curl -L --retry 3 --retry-delay 5 --progress-bar \
+    "https://huggingface.co/svilupp/onnx-cross-encoders/resolve/main/ms-marco-MiniLM-L-6-v2-onnx.zip" \
+    -o "$RERANKER_ZIP"
+
+  unzip -o "$RERANKER_ZIP" -d "$RERANKER_TEMP"
+
+  # Find the .onnx file inside the extracted folder
+  ONNX_FILE=$(find "$RERANKER_TEMP" -name "*.onnx" | head -1)
+  if [ -z "$ONNX_FILE" ]; then
+    echo "[pre-install] ❌ FATAL: No .onnx file found in zip"
+    exit 1
+  fi
+
+  cp "$ONNX_FILE" "$RERANKER_PATH"
+  rm -rf "$RERANKER_TEMP" "$RERANKER_ZIP"
+  echo "[pre-install] ✅ FP32 reranker extracted"
 else
   echo "[pre-install] ✅ reranker.onnx already present, skipping"
 fi
