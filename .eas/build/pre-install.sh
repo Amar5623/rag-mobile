@@ -27,34 +27,26 @@ if [ "$FILE_SIZE" -lt 10000000 ]; then
   exit 1
 fi
 
-# ── Download correct FP32 non‑quantized cross‑encoder ONNX ─────
+# ── Download your own TinyBERT-L-2-v2 ONNX ─────
 RERANKER_PATH="assets/models/reranker.onnx"
-# SHA256 of the CORRECT model (pre‑computed from the svilupp zip)
-EXPECTED_SHA256="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+RERANKER_ZIP="/tmp/tinybert_reranker.zip"
 
-echo "[pre-install] Removing any old reranker.onnx to force fresh download"
+echo "[pre-install] Removing any old reranker to force fresh download"
 rm -f "$RERANKER_PATH"
 
-echo "[pre-install] Downloading correct reranker ONNX (FP32, ~83MB)..."
-mkdir -p "$MODEL_DIR"
-
+echo "[pre-install] Downloading custom TinyBERT-L-2-v2 ONNX (~25MB)..."
 curl -L --retry 5 --retry-delay 10 --progress-bar \
-  "https://huggingface.co/svilupp/onnx-cross-encoders/resolve/main/ms-marco-MiniLM-L-6-v2-onnx.zip" \
-| funzip | tar -xO '*/ms-marco-MiniLM-L-6-v2.onnx' > "$RERANKER_PATH"
+  "https://huggingface.co/amardev/ms-marco-TinyBERT-L-2-v2-onnx/resolve/main/ms-marco-TinyBERT-L-2-v2-onnx.zip" \
+  -o "$RERANKER_ZIP"
 
-# Verify size
+unzip -p "$RERANKER_ZIP" 'model.onnx' > "$RERANKER_PATH"
+rm "$RERANKER_ZIP"
+
 FILE_SIZE=$(wc -c < "$RERANKER_PATH")
-if [ "$FILE_SIZE" -lt 80000000 ]; then
-  echo "[pre-install] ❌ FATAL: reranker.onnx is too small (${FILE_SIZE} bytes)"
+if [ "$FILE_SIZE" -lt 15000000 ]; then
+  echo "[pre-install] ❌ FATAL: reranker.onnx too small (${FILE_SIZE} bytes)"
   exit 1
 fi
-echo "[pre-install] ✅ FP32 reranker downloaded: ${FILE_SIZE} bytes"
-
-# ── Verify reranker isn't corrupted (should be ~85MB) ────────────
-FILE_SIZE=$(wc -c < "$RERANKER_PATH")
-if [ "$FILE_SIZE" -lt 10000000 ]; then
-  echo "[pre-install] ❌ FATAL: reranker.onnx is too small (${FILE_SIZE} bytes) — download likely failed"
-  exit 1
-fi
+echo "[pre-install] ✅ Custom TinyBERT reranker: ${FILE_SIZE} bytes"
 
 echo "[pre-install] ✅ All model assets ready"
