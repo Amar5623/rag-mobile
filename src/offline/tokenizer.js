@@ -20,8 +20,16 @@
 //   const localVec  = await embed('hello world');
 //   const sim = cosineSim(localVec, new Float32Array(serverVec.embedding));
 //   assert(sim > 0.99, `Tokenizer mismatch! sim=${sim}`);
+//
+// LOGGING ADDED: Vocab load (asset copy + parse time + token count), every
+// tokenize() call with input/output token count, wordpiece segmentation
+// failures (UNK fallbacks), and vocab reset — all tagged [tokenizer].
 
 import * as FileSystem from 'expo-file-system/legacy';
+import { createLogger } from '../utils/logger';
+
+// Module-level logger — all lines tagged [tokenizer]
+const log = createLogger('tokenizer');
 
 // ── Special token IDs (standard BERT / bge-small values) ──────────────────
 const UNK_ID = 100;  // [UNK]
@@ -39,17 +47,29 @@ let _vocabInit = null;   // Promise — ensures loadVocab() runs exactly once
  * Subsequent calls return the same promise (singleton pattern).
  */
 async function loadVocab() {
-  if (_vocabInit) return _vocabInit;
+  if (_vocabInit) {
+    log.debug('loadVocab() — already loaded (or in progress), awaiting singleton');
+    return _vocabInit;
+  }
+
+  log.info('loadVocab() — starting vocab load from asset:///models/vocab.txt …');
+  const startMs = Date.now();
 
   _vocabInit = (async () => {
     // The file is copied to the APK's assets/models/ by withModelAssets plugin.
     const assetUri = 'asset:///models/vocab.txt';
-    const dest = FileSystem.cacheDirectory + 'bge-vocab.txt';
+    const dest     = FileSystem.cacheDirectory + 'bge-vocab.txt';
+
     const info = await FileSystem.getInfoAsync(dest);
     if (!info.exists) {
+      log.debug('loadVocab() vocab.txt not in cache — copying from asset …');
       await FileSystem.copyAsync({ from: assetUri, to: dest });
+      log.debug('loadVocab() asset copy complete');
+    } else {
+      log.debug('loadVocab() vocab.txt found in cache at:', dest);
     }
 
+    log.debug('loadVocab() reading vocab.txt …');
     const text = await FileSystem.readAsStringAsync(dest);
     _vocab = new Map();
     text.split('\n').forEach((token, idx) => {
@@ -57,7 +77,7 @@ async function loadVocab() {
       if (t) _vocab.set(t, idx);
     });
 
-    console.log('[TOKENIZER] Vocab loaded:', _vocab.size, 'tokens');
+    log.info(`loadVocab() ✅ vocab loaded — ${_vocab.size} tokens in ${Date.now() - startMs}ms`);
   })();
 
   return _vocabInit;
@@ -72,13 +92,15 @@ async function loadVocab() {
  */
 function wordpiece(word) {
   // Fast-path: whole word is in vocab
-  if (_vocab.has(word)) return [_vocab.get(word)];
+  if (_vocab.has(word)) {
+    return [_vocab.get(word)];
+  }
 
   const ids = [];
   let start = 0;
 
   while (start < word.length) {
-    let end = word.length;
+    let end   = word.length;
     let found = false;
 
     while (start < end) {
@@ -95,6 +117,7 @@ function wordpiece(word) {
 
     if (!found) {
       // No subword found — map the whole word to [UNK] and bail
+      log.debug(`wordpiece() UNK fallback for word: "${word}"`);
       return [UNK_ID];
     }
   }
@@ -116,6 +139,8 @@ function wordpiece(word) {
 export async function tokenize(text) {
   await loadVocab();
 
+  log.debug('tokenize() — input length:', text.length, '| preview:', text.slice(0, 60));
+
   // bge-small: lowercase only — no accent stripping
   const clean = text
     .toLowerCase()
@@ -124,11 +149,18 @@ export async function tokenize(text) {
     .trim();
 
   const words = clean.split(' ').filter(Boolean);
-  const ids   = [CLS_ID];
+  log.debug('tokenize() — word count after normalisation:', words.length);
+
+  const ids = [CLS_ID];
+  let unkCount = 0;
 
   for (const word of words) {
-    if (ids.length >= MAX_SEQ - 1) break;  // leave room for SEP
+    if (ids.length >= MAX_SEQ - 1) {
+      log.debug('tokenize() — MAX_SEQ reached, truncating remaining words');
+      break; // leave room for SEP
+    }
     const pieces = wordpiece(word);
+    if (pieces.length === 1 && pieces[0] === UNK_ID) unkCount++;
     for (const id of pieces) {
       if (ids.length >= MAX_SEQ - 1) break;
       ids.push(id);
@@ -140,13 +172,23 @@ export async function tokenize(text) {
   // Right-pad with PAD_ID
   while (ids.length < MAX_SEQ) ids.push(PAD_ID);
 
-  return ids.slice(0, MAX_SEQ);
+  const finalIds = ids.slice(0, MAX_SEQ);
+
+  log.info('tokenize() DONE', {
+    inputWords:   words.length,
+    outputTokens: finalIds.filter(id => id !== PAD_ID).length, // non-padding
+    unkTokens:    unkCount,
+    totalLength:  finalIds.length,
+  });
+
+  return finalIds;
 }
 
 /**
  * Reset vocab (useful for testing or if assets are updated at runtime).
  */
 export function resetVocab() {
+  log.info('resetVocab() — clearing cached vocab and init promise');
   _vocab     = null;
   _vocabInit = null;
 }

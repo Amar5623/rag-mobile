@@ -35,7 +35,7 @@ if [ ! -f "$RERANKER_PATH" ]; then
     --retry 3 \
     --retry-delay 5 \
     --progress-bar \
-    "https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-6-v2/resolve/main/onnx/model.onnx" \
+    "https://huggingface.co/Xenova/ms-marco-MiniLM-L-6-v2/resolve/main/onnx/model.onnx" \
     -o "$RERANKER_PATH"
   echo "[pre-install] ✅ Reranker downloaded: $(du -sh $RERANKER_PATH | cut -f1)"
 else

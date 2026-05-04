@@ -7,20 +7,30 @@
 //     (BM25 + KNN + RRF). Falls back to BM25-only if embedder unavailable.
 //   - topK raised to 10 candidates before slicing to 5 for display (same as before)
 //   - All other modes (1 and 2) unchanged.
+//
+// LOGGING ADDED: Every call to send() is traced end-to-end — mode routing
+// decision, per-step progress, token streaming milestones, final outcome,
+// and all error paths — via createLogger('useChat').
 
 import { useState, useCallback, useRef } from 'react';
 import { streamChat, fetchOfflineResponse, clearSession } from '../api/chat';
-import { localSearch }  from './useOfflineSearch';  // P4: hybrid search
+import { localSearch } from './useOfflineSearch';  // P4: hybrid search
+import { createLogger } from '../utils/logger';
+
+// Module-level logger — all lines tagged [useChat]
+const log = createLogger('useChat');
 
 /**
  * @param {string} activeUrl — the currently working server URL from useNetwork.
  *                             Empty string when deep_offline.
  */
 export function useChat(activeUrl = '') {
-  const [messages,   setMessages]   = useState([]);
-  const [streaming,  setStreaming]  = useState(false);
+  const [messages, setMessages] = useState([]);
+  const [streaming, setStreaming] = useState(false);
   const [statusText, setStatusText] = useState('');
   const cancelRef = useRef(null);
+
+  log.debug('useChat() render — activeUrl:', activeUrl || '(none)', '| streaming:', streaming);
 
   /**
    * send(question, mode, pinnedFile)
@@ -30,14 +40,28 @@ export function useChat(activeUrl = '') {
    * Mode 3 deep_offline  — local hybrid search via localSearch() [P4]
    */
   const send = useCallback(async (question, mode = 'full_online', pinnedFile = null) => {
-    if (streaming) return;
+    log.info('send() CALLED', {
+      question: question.slice(0, 120),
+      mode,
+      pinnedFile: pinnedFile || '(none)',
+      activeUrl: activeUrl || '(none — deep_offline)',
+    });
 
-    const userMsg     = { id: Date.now(), role: 'user', content: question };
+    if (streaming) {
+      log.warn('send() BLOCKED — already streaming, ignoring new question');
+      return;
+    }
+
+    const userMsg = { id: Date.now(), role: 'user', content: question };
     const assistantId = Date.now() + 1;
+
+    log.debug('send() adding user message id:', userMsg.id);
     setMessages(prev => [...prev, userMsg]);
 
     // ── MODE 3: Deep offline — local hybrid BM25+KNN search ──────────────
     if (mode === 'deep_offline') {
+      log.info('send() → ROUTE: MODE 3 (deep_offline) — local hybrid search');
+
       setMessages(prev => [...prev, {
         id: assistantId, role: 'assistant', content: '',
         is_offline: true, offline_chunks: [],
@@ -45,24 +69,37 @@ export function useChat(activeUrl = '') {
       setStreaming(true);
       setStatusText('Searching local database…');
 
+      const startMs = Date.now();
+
       try {
+        log.info('send() [MODE 3] calling localSearch() — topK=10');
         // Request 10 candidates — RRF merge then slice to top 5 for display.
-        // This gives better coverage than requesting 5 directly.
         const rawChunks = await localSearch(question, 10); // P4: hybrid search
+
+        log.info('send() [MODE 3] localSearch() returned', rawChunks.length,
+          'candidates in', Date.now() - startMs, 'ms — slicing to top 5');
+
         const chunks = rawChunks.slice(0, 5).map(c => ({
-          source:       c.source,
-          page:         c.page,
-          content:      c.parent_content || c.content,
-          score:        c.score || 0,
-          chunk_type:   c.chunk_type   || 'text',
+          source: c.source,
+          page: c.page,
+          content: c.parent_content || c.content,
+          score: c.score || 0,
+          chunk_type: c.chunk_type || 'text',
           section_path: c.section_path || '',
-          heading:      c.heading      || '',
-          bbox:         c.bbox         || null,
+          heading: c.heading || '',
+          bbox: c.bbox || null,
         }));
+
+        log.info('send() [MODE 3] displaying', chunks.length, 'chunks:',
+          chunks.map(c => `${c.source}:p${c.page}(score=${c.score.toFixed(3)})`).join(', '));
+
         setMessages(prev => prev.map(m =>
           m.id === assistantId ? { ...m, offline_chunks: chunks } : m
         ));
+
+        log.info('send() [MODE 3] COMPLETE — total time:', Date.now() - startMs, 'ms');
       } catch (err) {
+        log.error('send() [MODE 3] localSearch() FAILED:', err.message, err);
         setMessages(prev => prev.map(m =>
           m.id === assistantId
             ? { ...m, content: `⚠️ Local search failed: ${err.message}`, isError: true }
@@ -71,12 +108,15 @@ export function useChat(activeUrl = '') {
       } finally {
         setStreaming(false);
         setStatusText('');
+        log.debug('send() [MODE 3] streaming=false, statusText cleared');
       }
       return;
     }
 
     // ── MODE 2: Intranet only (server up, no internet / Groq) ────────────
     if (mode === 'intranet_only') {
+      log.info('send() → ROUTE: MODE 2 (intranet_only) — server-side retrieval');
+
       setMessages(prev => [...prev, {
         id: assistantId, role: 'assistant', content: '',
         is_offline: true, offline_chunks: [],
@@ -84,14 +124,34 @@ export function useChat(activeUrl = '') {
       setStreaming(true);
       setStatusText('Searching manual sections…');
 
+      const startMs = Date.now();
+
       try {
+        log.info('send() [MODE 2] calling fetchOfflineResponse()', {
+          question: question.slice(0, 80),
+          pinnedFile: pinnedFile || '(none)',
+          activeUrl,
+        });
+
         const result = await fetchOfflineResponse(question, pinnedFile, activeUrl);
+
+        log.info('send() [MODE 2] fetchOfflineResponse() returned',
+          result.chunks?.length ?? 0, 'chunks in', Date.now() - startMs, 'ms');
+
+        if (result.chunks?.length) {
+          log.debug('send() [MODE 2] chunk sources:',
+            result.chunks.map(c => `${c.source}:p${c.page}`).join(', '));
+        }
+
         setMessages(prev => prev.map(m =>
           m.id === assistantId
             ? { ...m, offline_chunks: result.chunks || [] }
             : m
         ));
+
+        log.info('send() [MODE 2] COMPLETE — total time:', Date.now() - startMs, 'ms');
       } catch (err) {
+        log.error('send() [MODE 2] fetchOfflineResponse() FAILED:', err.message, err);
         setMessages(prev => prev.map(m =>
           m.id === assistantId
             ? { ...m, content: `⚠️ ${err.message}`, isError: true }
@@ -100,11 +160,14 @@ export function useChat(activeUrl = '') {
       } finally {
         setStreaming(false);
         setStatusText('');
+        log.debug('send() [MODE 2] streaming=false, statusText cleared');
       }
       return;
     }
 
     // ── MODE 1: Full online — XHR SSE streaming ──────────────────────────
+    log.info('send() → ROUTE: MODE 1 (full_online) — SSE streaming via Groq');
+
     setMessages(prev => [...prev, {
       id: assistantId, role: 'assistant', content: '',
       streaming: true, citations: [], image_urls: [],
@@ -113,31 +176,69 @@ export function useChat(activeUrl = '') {
     setStatusText('Searching documents…');
 
     let firstToken = false;
+    let tokenCount = 0;
+    const startMs = Date.now();
+
+    log.info('send() [MODE 1] opening SSE stream …');
 
     const cancel = streamChat(question, 'default', pinnedFile, {
       onEvent: (event) => {
+        // ── Token delta ──────────────────────────────────────────────────
         if (event.token !== undefined) {
-          if (!firstToken) { firstToken = true; setStatusText(''); }
+          tokenCount++;
+
+          if (!firstToken) {
+            firstToken = true;
+            log.info('send() [MODE 1] FIRST TOKEN received — time-to-first-token:',
+              Date.now() - startMs, 'ms');
+            setStatusText('');
+          }
+
+          if (tokenCount % 50 === 0) {
+            log.debug(`send() [MODE 1] streaming … ${tokenCount} tokens so far`);
+          }
+
           setMessages(prev => prev.map(m =>
             m.id === assistantId
               ? { ...m, content: m.content + event.token }
               : m
           ));
-        } else if (event.done === true) {
+        }
+
+        // ── Done event ───────────────────────────────────────────────────
+        else if (event.done === true) {
+          log.info('send() [MODE 1] DONE event received', {
+            totalTokens: tokenCount,
+            elapsedMs: Date.now() - startMs,
+            citations: event.citations?.length ?? 0,
+            image_urls: event.image_urls?.length ?? 0,
+            usage: event.usage,
+          });
+
+          if (event.citations?.length) {
+            log.debug('send() [MODE 1] citations:',
+              event.citations.map(c => `${c.source}:p${c.page}`).join(', '));
+          }
+
           setMessages(prev => prev.map(m =>
             m.id === assistantId
               ? {
-                  ...m,
-                  streaming:  false,
-                  citations:  event.citations  || [],
-                  image_urls: event.image_urls || [],
-                  usage:      event.usage      || {},
-                }
+                ...m,
+                streaming: false,
+                citations: event.citations || [],
+                image_urls: event.image_urls || [],
+                usage: event.usage || {},
+              }
               : m
           ));
           setStreaming(false);
           setStatusText('');
-        } else if (event.type === 'error' || event.error) {
+          log.debug('send() [MODE 1] streaming=false after done event');
+        }
+
+        // ── Error event from server ──────────────────────────────────────
+        else if (event.type === 'error' || event.error) {
+          log.error('send() [MODE 1] server error event:', event.message || event.error);
           setMessages(prev => prev.map(m =>
             m.id === assistantId
               ? { ...m, content: `⚠️ ${event.message || event.error}`, streaming: false }
@@ -146,15 +247,25 @@ export function useChat(activeUrl = '') {
           setStreaming(false);
           setStatusText('');
         }
+
+        // ── Unknown event ────────────────────────────────────────────────
+        else {
+          log.debug('send() [MODE 1] unhandled event type:', JSON.stringify(event).slice(0, 100));
+        }
       },
+
       onDone: () => {
+        log.info('send() [MODE 1] SSE connection onDone — tokens streamed:', tokenCount,
+          '| elapsed:', Date.now() - startMs, 'ms');
         setMessages(prev => prev.map(m =>
           m.id === assistantId && m.streaming ? { ...m, streaming: false } : m
         ));
         setStreaming(false);
         setStatusText('');
       },
+
       onError: (err) => {
+        log.error('send() [MODE 1] SSE connection ERROR:', err.message, err);
         setMessages(prev => prev.map(m =>
           m.id === assistantId
             ? { ...m, content: `⚠️ ${err.message}`, streaming: false }
@@ -166,18 +277,32 @@ export function useChat(activeUrl = '') {
     }, activeUrl);
 
     cancelRef.current = cancel;
+    log.debug('send() [MODE 1] SSE stream started, cancelRef stored');
   }, [streaming, activeUrl]);
 
+  // ── cancel() ─────────────────────────────────────────────────────────────
   const cancel = useCallback(() => {
+    log.info('cancel() called — aborting current stream');
     cancelRef.current?.();
     setStreaming(false);
     setStatusText('');
   }, []);
 
+  // ── clear() ──────────────────────────────────────────────────────────────
   const clear = useCallback(async () => {
+    log.info('clear() called — cancelling stream and clearing messages');
     cancelRef.current?.();
-    try { await clearSession('default', activeUrl); } catch { /* ignore if offline */ }
+
+    try {
+      log.debug('clear() → clearSession() on server');
+      await clearSession('default', activeUrl);
+      log.info('clear() server session cleared');
+    } catch (err) {
+      log.warn('clear() clearSession() failed (ignored if offline):', err.message);
+    }
+
     setMessages([]);
+    log.info('clear() DONE — messages reset to []');
   }, [activeUrl]);
 
   return { messages, streaming, statusText, send, clear, cancel };

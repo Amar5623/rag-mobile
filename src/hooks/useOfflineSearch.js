@@ -18,6 +18,11 @@
 //         not a count derived from the payload.
 //
 //   KEPT — All P3/P4/P5 logic unchanged (etag delta, on-device embedder, polling).
+//
+// LOGGING ADDED: Every stage of the sync pipeline (URL read, /kb/export request,
+// etag check, chunk/vector counts, DB write, PDF sync, polling), every localSearch()
+// step (embed, BM25+KNN, rerank), and every mode/URL transition trigger is logged
+// via createLogger('useOfflineSearch').
 
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { NetworkMode } from './useNetwork';
@@ -30,8 +35,12 @@ import {
   hybridSearchChunks,
 } from '../offline/db';
 import { getEmbedder } from '../offline/embedder';
-import { syncPdfs } from '../offline/pdfSync';
+import { syncPdfs }    from '../offline/pdfSync';
 import { getReranker } from '../offline/reranker';
+import { createLogger } from '../utils/logger';
+
+// Module-level logger — all lines tagged [useOfflineSearch]
+const log = createLogger('useOfflineSearch');
 
 const SYNC_STALE_MS    = 10 * 60 * 1000;
 const POLL_INTERVAL_MS = 10 * 60 * 1000;
@@ -44,62 +53,102 @@ let _embedder = null;
 let _reranker = null;
 
 async function getLocalEmbedder() {
-  if (_embedder) return _embedder;
+  if (_embedder) {
+    log.debug('getLocalEmbedder() → returning cached embedder');
+    return _embedder;
+  }
+  log.info('getLocalEmbedder() → initialising on-device embedder …');
   try {
     _embedder = await getEmbedder();
-    console.log('[useOfflineSearch] On-device embedder ready');
+    log.info('getLocalEmbedder() ✅ On-device embedder ready');
   } catch (e) {
-    console.warn('[useOfflineSearch] Embedder unavailable, BM25 only:', e.message);
+    log.warn('getLocalEmbedder() ⚠ Embedder unavailable — BM25 only:', e.message);
     _embedder = null;
   }
   return _embedder;
+}
+
+async function getLocalReranker() {
+  if (_reranker) {
+    log.debug('getLocalReranker() → returning cached reranker');
+    return _reranker;
+  }
+  log.info('getLocalReranker() → initialising cross-encoder reranker …');
+  try {
+    _reranker = await getReranker();
+    log.info('getLocalReranker() ✅ Cross-encoder reranker ready');
+  } catch (e) {
+    log.warn('getLocalReranker() ⚠ Reranker unavailable:', e.message);
+    _reranker = null;
+  }
+  return _reranker;
 }
 
 // ─────────────────────────────────────────────────────────────
 // P4: localSearch — called by useChat.js in Mode 3
 // ─────────────────────────────────────────────────────────────
 
-async function getLocalReranker() {
-  if (_reranker) return _reranker;
-  try {
-    _reranker = await getReranker();
-    console.log('[useOfflineSearch] Cross-encoder reranker ready');
-  } catch (e) {
-    console.warn('[useOfflineSearch] Reranker unavailable:', e.message);
-    _reranker = null;
-  }
-  return _reranker;
-}
-
-// ─── replace localSearch entirely ────────────────────────────
 export async function localSearch(query, topK = 5) {
+  log.info('localSearch() START', { query: query.slice(0, 100), topK });
+  const startMs = Date.now();
+
   // Step 1 — embed query for KNN
   let queryVec = null;
   try {
+    log.debug('localSearch() STEP 1 — embedding query on-device …');
     const embedder = await getLocalEmbedder();
-    if (embedder) queryVec = await embedder.embed(query);
+    if (embedder) {
+      queryVec = await embedder.embed(query);
+      log.info('localSearch() STEP 1 ✅ query embedded — dim:', queryVec?.length);
+    } else {
+      log.warn('localSearch() STEP 1 ⚠ No embedder — KNN disabled, BM25 only');
+    }
   } catch (e) {
-    console.warn('[useOfflineSearch] Embed failed, BM25 only:', e.message);
+    log.warn('localSearch() STEP 1 embed FAILED (BM25 only):', e.message);
   }
 
   // Step 2 — hybrid retrieve: get more candidates than topK
   //          so the reranker has material to work with
   const RETRIEVE_K = Math.max(topK * 4, 20);  // e.g. topK=5 → fetch 20
+  log.info('localSearch() STEP 2 — hybridSearchChunks()', {
+    query: query.slice(0, 80),
+    hasQueryVec: queryVec !== null,
+    RETRIEVE_K,
+  });
+
   const candidates = await hybridSearchChunks(query, queryVec, RETRIEVE_K);
+  log.info('localSearch() STEP 2 ✅ hybridSearchChunks returned', candidates.length,
+    'candidates in', Date.now() - startMs, 'ms');
+
+  if (candidates.length === 0) {
+    log.warn('localSearch() no candidates found — returning empty results');
+    return [];
+  }
 
   // Step 3 — rerank if available, then slice to topK
   try {
+    log.debug('localSearch() STEP 3 — loading reranker …');
     const reranker = await getLocalReranker();
     if (reranker && candidates.length > 0) {
+      log.info('localSearch() STEP 3 — reranking', candidates.length, 'candidates …');
       const reranked = await reranker.rerank(query, candidates);
-      return reranked.slice(0, topK);
+      const result   = reranked.slice(0, topK);
+      log.info('localSearch() STEP 3 ✅ reranked — returning top', result.length,
+        'in', Date.now() - startMs, 'ms total |',
+        result.map(c => `${c.source}:p${c.page}(${c.rerankerScore?.toFixed(3) ?? c.score?.toFixed(3)})`).join(', '));
+      return result;
+    } else {
+      log.warn('localSearch() STEP 3 ⚠ Reranker unavailable — using RRF order');
     }
   } catch (e) {
-    console.warn('[useOfflineSearch] Reranker failed, using RRF order:', e.message);
+    log.warn('localSearch() STEP 3 reranker FAILED — using RRF order:', e.message);
   }
 
   // Fallback: return RRF-ordered results without reranking
-  return candidates.slice(0, topK);
+  const result = candidates.slice(0, topK);
+  log.info('localSearch() COMPLETE (no reranker) — returning', result.length,
+    'in', Date.now() - startMs, 'ms total');
+  return result;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -109,51 +158,54 @@ export async function localSearch(query, topK = 5) {
 async function shouldSync() {
   try {
     const lastSynced = await getSyncMeta('last_synced');
-    if (!lastSynced) return true;
-    return Date.now() - new Date(lastSynced).getTime() > SYNC_STALE_MS;
-  } catch {
+    if (!lastSynced) {
+      log.info('shouldSync() → true (never synced)');
+      return true;
+    }
+    const ageMs  = Date.now() - new Date(lastSynced).getTime();
+    const stale  = ageMs > SYNC_STALE_MS;
+    log.info('shouldSync() →', stale ? 'true (stale)' : 'false (fresh)',
+      `| last synced: ${lastSynced} | age: ${Math.round(ageMs / 1000)}s`);
+    return stale;
+  } catch (err) {
+    log.warn('shouldSync() error reading sync_meta:', err.message, '→ defaulting to true');
     return true;
   }
 }
 
 // ─────────────────────────────────────────────────────────────
 // EMBEDDING VALIDATOR
-// Logs the shape of what's about to be written to SQLite so any
-// Float32Array / plain-array mismatch in db.js is immediately visible.
 // ─────────────────────────────────────────────────────────────
 
 function validateAndLogEmbeddings(chunks) {
   const withEmbedding = chunks.filter(c => c.embedding != null);
   const without       = chunks.length - withEmbedding.length;
 
-  console.log(
-    `[SYNC/validate] ${chunks.length} chunks total — ` +
-    `${withEmbedding.length} have embedding, ${without} do not`
+  log.info(
+    `validateAndLogEmbeddings() ${chunks.length} chunks total — ` +
+    `${withEmbedding.length} have embedding, ${without} do not`,
   );
 
   if (withEmbedding.length === 0) {
-    console.warn('[SYNC/validate] ⚠ No embeddings in payload — server may not be sending vectors');
+    log.warn('validateAndLogEmbeddings() ⚠ No embeddings in payload — server may not be sending vectors');
     return;
   }
 
-  // Inspect first embedding for type/shape issues
   const first = withEmbedding[0].embedding;
-  console.log(
-    `[SYNC/validate] First embedding — ` +
-    `type=${Object.prototype.toString.call(first)}, ` +
-    `length=${first?.length}, ` +
-    `isArray=${Array.isArray(first)}, ` +
-    `isFloat32=${first instanceof Float32Array}, ` +
-    `sample=[${Array.isArray(first) ? first.slice(0, 3).map(v => v.toFixed(4)).join(', ') : 'n/a'}]`
+  log.info(
+    'validateAndLogEmbeddings() first embedding —',
+    `type=${Object.prototype.toString.call(first)},`,
+    `length=${first?.length},`,
+    `isArray=${Array.isArray(first)},`,
+    `isFloat32=${first instanceof Float32Array},`,
+    `sample=[${Array.isArray(first) ? first.slice(0, 3).map(v => v.toFixed(4)).join(', ') : 'n/a'}]`,
   );
 
-  // Warn if it's a plain array — db.js MUST convert to Float32Array before
-  // inserting into sqlite-vec, otherwise the write silently drops the vector.
   if (Array.isArray(first)) {
-    console.warn(
-      '[SYNC/validate] ⚠ Embeddings are plain JS arrays. ' +
+    log.warn(
+      'validateAndLogEmbeddings() ⚠ Embeddings are plain JS arrays. ' +
       'db.js must call new Float32Array(embedding).buffer before sqlite-vec insert. ' +
-      'If not done, vectors will be stored as 0.'
+      'If not done, vectors will be stored as 0.',
     );
   }
 }
@@ -163,89 +215,122 @@ function validateAndLogEmbeddings(chunks) {
 // ─────────────────────────────────────────────────────────────
 
 async function syncFromServer(activeUrl) {
-  const storedEtag = await getSyncMeta('export_etag') || '';
+  log.info('syncFromServer() START → activeUrl:', activeUrl);
 
-  const res = await fetch(`${activeUrl}/kb/export?include_vectors=true`, {
+  const storedEtag = await getSyncMeta('export_etag') || '';
+  log.debug('syncFromServer() stored etag:', storedEtag || '(none)');
+
+  const exportUrl = `${activeUrl}/kb/export?include_vectors=true`;
+  log.info('syncFromServer() → GET', exportUrl,
+    storedEtag ? `(If-None-Match: ${storedEtag})` : '(no etag)');
+
+  const startMs = Date.now();
+
+  const res = await fetch(exportUrl, {
     headers: {
       'Content-Type': 'application/json',
       ...(storedEtag ? { 'If-None-Match': storedEtag } : {}),
     },
   });
 
-  let chunksSkipped = false;
-  let receivedChunks = 0;
-  let receivedVectors = 0; // count from JSON payload (what server sent)
+  log.info('syncFromServer() /kb/export response:', res.status,
+    '| elapsed:', Date.now() - startMs, 'ms');
+
+  let chunksSkipped   = false;
+  let receivedChunks  = 0;
+  let receivedVectors = 0;
 
   if (res.status === 304) {
     chunksSkipped = true;
-    console.log('[SYNC] 304 Not Modified — chunks unchanged, skipping DB write');
+    log.info('syncFromServer() 304 Not Modified — chunks unchanged, skipping DB write');
 
   } else if (res.ok) {
-    const data   = await res.json();
-    const chunks = data.chunks || [];
+    const data    = await res.json();
+    const chunks  = data.chunks || [];
     const newEtag = data.etag || res.headers.get('X-Export-Etag') || '';
 
     receivedChunks  = chunks.length;
-    // FIX: this only counts what arrived — does NOT mean they were stored correctly
-    receivedVectors = chunks.filter(c => Array.isArray(c.embedding) && c.embedding.length > 0).length;
+    receivedVectors = chunks.filter(
+      c => Array.isArray(c.embedding) && c.embedding.length > 0
+    ).length;
 
-    console.log(`[SYNC] Received ${receivedChunks} chunks, ${receivedVectors} with embeddings from server`);
+    log.info(`syncFromServer() received ${receivedChunks} chunks, ${receivedVectors} with embeddings`);
+    if (newEtag) log.debug('syncFromServer() new etag from server:', newEtag);
 
-    // Validate embedding shape BEFORE writing — surfaces db.js Float32Array issues
+    // Validate embedding shape BEFORE writing
     validateAndLogEmbeddings(chunks);
 
-    // Atomic replace: chunks + FTS + vectors
-    // db.js MUST convert embedding: number[] → Float32Array buffer for sqlite-vec
+    log.info('syncFromServer() → replaceAllChunksWithVectors() writing to SQLite …');
+    const dbStartMs = Date.now();
     await replaceAllChunksWithVectors(chunks);
+    log.info('syncFromServer() DB write complete in', Date.now() - dbStartMs, 'ms');
 
     if (newEtag) await setSyncMeta('export_etag', newEtag);
 
   } else {
+    log.error(`syncFromServer() /kb/export FAILED: HTTP ${res.status}`);
     throw new Error(`/kb/export failed: HTTP ${res.status}`);
   }
 
   // PDF sync — always runs regardless of chunk etag
-  const pdfResult = await syncPdfs(activeUrl);
+  log.info('syncFromServer() → syncPdfs() starting …');
+  const pdfStartMs = Date.now();
+  const pdfResult  = await syncPdfs(activeUrl);
+  log.info('syncFromServer() syncPdfs() DONE in', Date.now() - pdfStartMs, 'ms', {
+    synced:  pdfResult.synced.length,
+    deleted: pdfResult.deleted.length,
+    errors:  pdfResult.errors.length,
+  });
+  if (pdfResult.errors.length) {
+    log.warn('syncFromServer() PDF sync errors:', pdfResult.errors);
+  }
 
   // Read actual stored counts from DB — ground truth after the write
-  // FIX: use these values, not the received counts, for reporting
   const [storedChunks, storedVectors] = await Promise.all([
     getChunkCount(),
     getVectorCount(),
   ]);
+
+  log.info('syncFromServer() DB ground-truth counts:', {
+    storedChunks,
+    storedVectors,
+    receivedChunks,
+    receivedVectors,
+  });
 
   // Persist sync metadata
   await setSyncMeta('last_synced',  new Date().toISOString());
   await setSyncMeta('chunk_count',  String(storedChunks));
   await setSyncMeta('vector_count', String(storedVectors));
 
-  // FIX: log received vs stored side by side — any mismatch = db.js write bug
   if (!chunksSkipped) {
-    console.log(
-      `[SYNC] DB write complete — ` +
-      `chunks: received=${receivedChunks} stored=${storedChunks} | ` +
-      `vectors: received=${receivedVectors} stored=${storedVectors}`
-    );
-
     if (receivedVectors > 0 && storedVectors === 0) {
-      console.error(
-        '[SYNC] ✗ Vector storage failure — received embeddings but stored 0. ' +
-        'Fix: in db.js replaceAllChunksWithVectors(), convert embedding to ' +
-        'new Float32Array(chunk.embedding).buffer before inserting into vec_chunks.'
+      log.error(
+        'syncFromServer() ✗ VECTOR STORAGE FAILURE — received', receivedVectors,
+        'but stored 0. Fix: in db.js replaceAllChunksWithVectors(), convert embedding to ' +
+        'new Float32Array(chunk.embedding).buffer before inserting into vec_chunks.',
       );
     } else if (storedVectors < receivedVectors) {
-      console.warn(
-        `[SYNC] ⚠ Partial vector loss — received ${receivedVectors}, stored ${storedVectors}. ` +
-        `Check for per-row errors in replaceAllChunksWithVectors().`
+      log.warn(
+        `syncFromServer() ⚠ Partial vector loss — received ${receivedVectors}, stored ${storedVectors}.`,
+        'Check for per-row errors in replaceAllChunksWithVectors().',
       );
     } else {
-      console.log(`[SYNC] ✅ Vectors stored correctly (${storedVectors}/${receivedVectors})`);
+      log.info(`syncFromServer() ✅ Vectors stored correctly (${storedVectors}/${receivedVectors})`);
     }
   }
 
+  log.info('syncFromServer() COMPLETE — total time:', Date.now() - startMs, 'ms', {
+    storedChunks,
+    storedVectors,
+    chunksSkipped,
+    pdfsSynced:  pdfResult.synced.length,
+    pdfsDeleted: pdfResult.deleted.length,
+  });
+
   return {
-    chunks:        storedChunks,   // FIX: ground truth from DB, not JSON payload count
-    vectors:       storedVectors,  // FIX: ground truth from DB, not JSON payload count
+    chunks:        storedChunks,
+    vectors:       storedVectors,
     chunksSkipped,
     pdfsSynced:    pdfResult.synced.length,
     pdfsDeleted:   pdfResult.deleted.length,
@@ -272,6 +357,7 @@ export function useOfflineSearch(mode, activeUrl = '') {
 
   // Load persisted state on mount
   useEffect(() => {
+    log.info('useOfflineSearch() MOUNT — loading persisted sync metadata …');
     (async () => {
       try {
         const [lastSynced, count, vcount] = await Promise.all([
@@ -279,23 +365,41 @@ export function useOfflineSearch(mode, activeUrl = '') {
           getChunkCount(),
           getVectorCount(),
         ]);
+        log.info('useOfflineSearch() persisted state loaded:', {
+          lastSynced: lastSynced || '(never)',
+          chunkCount: count,
+          vectorCount: vcount,
+        });
         setSyncStatus(s => ({ ...s, lastSynced, chunkCount: count, vectorCount: vcount }));
-      } catch { /* non-fatal */ }
+      } catch (err) {
+        log.warn('useOfflineSearch() failed to load persisted state:', err.message);
+      }
     })();
   }, []);
 
   const triggerSync = useCallback(async (urlOverride, opts = {}) => {
-    if (isSyncingRef.current) return;
+    if (isSyncingRef.current) {
+      log.warn('triggerSync() SKIPPED — sync already in progress');
+      return;
+    }
+
     const url = urlOverride || activeUrl;
-    if (!url) return;
+    if (!url) {
+      log.warn('triggerSync() SKIPPED — no URL available');
+      return;
+    }
 
     if (!opts.force) {
       const needed = await shouldSync();
       if (!needed) {
-        console.log('[useOfflineSearch] Sync not needed (data is fresh)');
+        log.info('triggerSync() SKIPPED — data is fresh (within 10 min)');
         return;
       }
+    } else {
+      log.info('triggerSync() force=true — bypassing stale check');
     }
+
+    log.info('triggerSync() START — url:', url, '| force:', opts.force ?? false);
 
     isSyncingRef.current = true;
     setSyncStatus(s => ({ ...s, isSyncing: true }));
@@ -303,7 +407,6 @@ export function useOfflineSearch(mode, activeUrl = '') {
     try {
       const result = await syncFromServer(url);
 
-      // FIX: result.chunks and result.vectors are now DB ground-truth values
       setSyncStatus(s => ({
         ...s,
         isSyncing:   false,
@@ -313,16 +416,15 @@ export function useOfflineSearch(mode, activeUrl = '') {
         lastResult:  result,
       }));
 
-      // FIX: log shows stored counts, not received counts
-      console.log(
-        `[useOfflineSearch] Sync complete — ` +
-        `${result.chunks} chunks, ${result.vectors} vectors, ` +
-        `${result.pdfsSynced} PDFs` +
-        (result.chunksSkipped ? ' (304 — data unchanged)' : '')
-      );
+      log.info('triggerSync() ✅ COMPLETE', {
+        chunks:        result.chunks,
+        vectors:       result.vectors,
+        pdfsSynced:    result.pdfsSynced,
+        chunksSkipped: result.chunksSkipped,
+      });
 
     } catch (err) {
-      console.warn('[useOfflineSearch] Sync failed:', err.message);
+      log.error('triggerSync() ✗ FAILED:', err.message, err);
       setSyncStatus(s => ({
         ...s,
         isSyncing:  false,
@@ -330,17 +432,26 @@ export function useOfflineSearch(mode, activeUrl = '') {
       }));
     } finally {
       isSyncingRef.current = false;
+      log.debug('triggerSync() isSyncingRef reset to false');
     }
   }, [activeUrl]);
 
   // Effect 1: mode transition deep_offline → reachable
   useEffect(() => {
-    const prev          = prevMode.current;
+    const prev           = prevMode.current;
     const isNowReachable = mode === NetworkMode.FULL_ONLINE || mode === NetworkMode.INTRANET_ONLY;
     const wasOffline     = prev === NetworkMode.DEEP_OFFLINE || prev === null;
 
+    log.debug('useOfflineSearch() Effect 1 (mode change):', {
+      prev:            prev ?? 'null (initial)',
+      current:         mode,
+      isNowReachable,
+      wasOffline,
+      activeUrl:       activeUrl || '(none)',
+    });
+
     if (isNowReachable && wasOffline && activeUrl) {
-      console.log('[useOfflineSearch] Mode became reachable — triggering sync');
+      log.info('useOfflineSearch() Effect 1 → mode became reachable — triggering sync');
       triggerSync(activeUrl);
     }
     prevMode.current = mode;
@@ -348,8 +459,13 @@ export function useOfflineSearch(mode, activeUrl = '') {
 
   // Effect 2: activeUrl first becomes available
   useEffect(() => {
+    log.debug('useOfflineSearch() Effect 2 (activeUrl change):', {
+      activeUrl: activeUrl || '(none)',
+      prev:      prevActiveUrl.current || '(none)',
+    });
+
     if (activeUrl && !prevActiveUrl.current) {
-      console.log('[useOfflineSearch] Backend URL became available — triggering sync');
+      log.info('useOfflineSearch() Effect 2 → backend URL became available — triggering sync');
       triggerSync(activeUrl);
     }
     prevActiveUrl.current = activeUrl;
@@ -358,17 +474,38 @@ export function useOfflineSearch(mode, activeUrl = '') {
   // Effect 3: 10-min polling while reachable
   useEffect(() => {
     const isReachable = mode === NetworkMode.FULL_ONLINE || mode === NetworkMode.INTRANET_ONLY;
-    if (!isReachable || !activeUrl) return;
+
+    if (!isReachable || !activeUrl) {
+      log.debug('useOfflineSearch() Effect 3 (poll) — skipping setup (not reachable or no url)');
+      return;
+    }
+
+    log.info('useOfflineSearch() Effect 3 — setting up 10-min poll for:', activeUrl);
 
     const poll = () => {
-      if (isSyncingRef.current) return;
-      console.log('[useOfflineSearch] Poll tick — checking for updates');
+      if (isSyncingRef.current) {
+        log.debug('useOfflineSearch() poll tick — sync already running, skipping');
+        return;
+      }
+      log.info('useOfflineSearch() poll tick — checking for updates …');
       triggerSync(activeUrl);
     };
 
-    const initialDelay = setTimeout(poll, 60_000);
-    const interval     = setInterval(poll, POLL_INTERVAL_MS);
-    return () => { clearTimeout(initialDelay); clearInterval(interval); };
+    const initialDelay = setTimeout(() => {
+      log.debug('useOfflineSearch() poll — initial 60s delay fired');
+      poll();
+    }, 60_000);
+
+    const interval = setInterval(() => {
+      log.debug('useOfflineSearch() poll — interval fired');
+      poll();
+    }, POLL_INTERVAL_MS);
+
+    return () => {
+      log.info('useOfflineSearch() Effect 3 (poll) — cleaning up');
+      clearTimeout(initialDelay);
+      clearInterval(interval);
+    };
   }, [mode, activeUrl, triggerSync]);
 
   return { syncStatus, triggerSync };
