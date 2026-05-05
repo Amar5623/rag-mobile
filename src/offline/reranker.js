@@ -284,27 +284,20 @@ async function _tokenizePair(query, chunkText, pairIndex) {
     tokenize(chunkText, { addSpecialTokens: false }),
   ]);
 
-  // ── DEBUG: inspect raw token IDs ──
-  log.debug(`_tokenizePair(pair=${pairIndex}) query tokens (first 10):`, queryTokens.slice(0, 10));
-  log.debug(`_tokenizePair(pair=${pairIndex}) chunk tokens (first 10):`, chunkTokens.slice(0, 10));
-  const unkCount = [...queryTokens, ...chunkTokens].filter(id => id === 100).length;
-  if (unkCount > 50) {
-    log.warn(`_tokenizePair(pair=${pairIndex}) High UNK token count: ${unkCount} / ${queryTokens.length + chunkTokens.length}`);
-  }
-
   // Reserve 3 slots for [CLS], [SEP], [SEP]
-  const maxChunkLen    = MAX_LENGTH - queryTokens.length - 3;
-  const truncatedChunk = chunkTokens.slice(0, maxChunkLen);
+  // Also cap chunk so total never exceeds 128 (model fixed seq_len)
+  const maxChunkLen    = 128 - queryTokens.length - 3;
+  const truncatedChunk = chunkTokens.slice(0, Math.max(0, maxChunkLen));
 
   if (chunkTokens.length > maxChunkLen) {
-    log.warn(
+    log.debug(
       `_tokenizePair(pair=${pairIndex}) chunk truncated:`,
-      chunkTokens.length, '→', truncatedChunk.length, 'tokens',
+      chunkTokens.length, '→', truncatedChunk.length,
     );
   }
 
   // Build sequence: [CLS] query [SEP] chunk [SEP]
-  const inputIds = [
+  const raw = [
     CLS_ID,
     ...queryTokens,
     SEP_ID,
@@ -312,20 +305,35 @@ async function _tokenizePair(query, chunkText, pairIndex) {
     SEP_ID,
   ];
 
-  // token_type_ids: 0 = query segment, 1 = chunk segment
-  const tokenTypeIds = [
-    0,                                            // CLS
-    ...new Array(queryTokens.length).fill(0),     // query tokens
-    0,                                            // SEP after query
-    ...new Array(truncatedChunk.length).fill(1),  // chunk tokens
-    1,                                            // SEP after chunk
+  const rawTypes = [
+    0,
+    ...new Array(queryTokens.length).fill(0),
+    0,
+    ...new Array(truncatedChunk.length).fill(1),
+    1,
   ];
 
-  const attentionMask = new Array(inputIds.length).fill(1);
+  const actualLen = raw.length;
+
+  // ── PAD to exactly 128 ───────────────────────────────────────────────────
+  // Model input_ids dims=[-1, 128] — buffer MUST be exactly 128 * 8 = 1024 bytes.
+  // Without padding, short sequences produce buffer < 1024 bytes → C++ infers
+  // batch=0 → ORT gets shape [0,128,128] → Reshape fails with the error above.
+  const inputIds      = new Array(128).fill(PAD_ID);
+  const tokenTypeIds  = new Array(128).fill(0);
+  const attentionMask = new Array(128).fill(0);  // 0 = ignore padding positions
+
+  for (let i = 0; i < Math.min(actualLen, 128); i++) {
+    inputIds[i]      = raw[i];
+    tokenTypeIds[i]  = rawTypes[i];
+    attentionMask[i] = 1;  // 1 = attend to real tokens only
+  }
 
   log.debug(
-    `_tokenizePair(pair=${pairIndex}) seq_len=${inputIds.length}`,
-    `(query=${queryTokens.length} + chunk=${truncatedChunk.length} + 3 special)`,
+    `_tokenizePair(pair=${pairIndex})`,
+    `actualLen=${actualLen} paddedTo=128`,
+    `realTokens=${actualLen} padTokens=${128 - actualLen}`,
+    `byteSize=${128 * 8} (must be 1024)`,
   );
 
   return { inputIds, tokenTypeIds, attentionMask };
