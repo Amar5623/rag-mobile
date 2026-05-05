@@ -40,7 +40,7 @@ const log = createLogger('reranker');
 
 // Bump this whenever pre-install.sh downloads a new model.
 // Changes the cached filename → forces fresh copy from APK on next cold start.
-const MODEL_VERSION = 'tinybert-l2-v2';
+const MODEL_VERSION = 'xenova-tinybert-l2-v2';
 
 // ─────────────────────────────────────────────────────────────
 // CONSTANTS (BERT special token IDs)
@@ -175,13 +175,39 @@ async function _initSession() {
   // Log node names — if output contains 'hidden_state', model has no head
   const inputNames  = _session.inputNames  ?? [];
   const outputNames = _session.outputNames ?? [];
-  log.info('_initSession() INPUT  nodes:', inputNames.join(' | ')  || '(none)');
-  log.info('_initSession() OUTPUT nodes:', outputNames.join(' | ') || '(none)');
+  
+  // Log raw types and values for debugging
+  log.info('_initSession() inputNames type:', typeof inputNames, Array.isArray(inputNames));
+  log.info('_initSession() outputNames type:', typeof outputNames, Array.isArray(outputNames));
+  log.info('_initSession() raw outputNames:', JSON.stringify(outputNames));
+  
+  // ── ENHANCED DEBUG: log complete session metadata ──
+  log.info('_initSession() session metadata:', JSON.stringify({
+    inputNames:   _session.inputNames,
+    outputNames:  _session.outputNames,
+    inputShapes:  _session.inputShapes ?? 'N/A',
+    outputShapes: _session.outputShapes ?? 'N/A',
+    backend:      _session.backend ?? 'unknown',
+  }, null, 2));
+
+  // FIX: Handle both array of strings and array of {name} objects
+  const outputNameStrings = (Array.isArray(outputNames) ? outputNames : [])
+    .map(n => {
+      if (typeof n === 'string') return n;
+      if (n && typeof n === 'object' && n.name) return n.name;
+      return '';
+    })
+    .filter(Boolean);
+    
+  log.info('_initSession() INPUT  nodes:', 
+    (Array.isArray(inputNames) ? inputNames : []).join(' | ') || '(none)');
+  log.info('_initSession() OUTPUT nodes:', outputNameStrings.join(' | ') || '(none)');
 
   // Guard: detect backbone-only export (no classification head)
-  const isBackboneOnly = outputNames.some(
+  const isBackboneOnly = outputNameStrings.some(
     n => n.includes('hidden_state') || n.includes('last_hidden'),
   );
+  
   if (isBackboneOnly) {
     throw new Error(
       '[RERANKER] Model has no classification head — output is hidden states. ' +
@@ -229,6 +255,14 @@ async function _tokenizePair(query, chunkText, pairIndex) {
     tokenize(query,     { addSpecialTokens: false }),
     tokenize(chunkText, { addSpecialTokens: false }),
   ]);
+
+  // ── DEBUG: inspect raw token IDs ──
+  log.debug(`_tokenizePair(pair=${pairIndex}) query tokens (first 10):`, queryTokens.slice(0, 10));
+  log.debug(`_tokenizePair(pair=${pairIndex}) chunk tokens (first 10):`, chunkTokens.slice(0, 10));
+  const unkCount = [...queryTokens, ...chunkTokens].filter(id => id === 100).length;
+  if (unkCount > 50) {
+    log.warn(`_tokenizePair(pair=${pairIndex}) High UNK token count: ${unkCount} / ${queryTokens.length + chunkTokens.length}`);
+  }
 
   // Reserve 3 slots for [CLS], [SEP], [SEP]
   const maxChunkLen    = MAX_LENGTH - queryTokens.length - 3;
@@ -292,18 +326,47 @@ async function _scoreOne(query, chunkText, pairIndex) {
   const { inputIds, tokenTypeIds, attentionMask } =
     await _tokenizePair(query, chunkText, pairIndex);
 
+  // ── DEBUG: Check model inputs and what we're feeding ──
+  const requiredInputs = _session.inputNames || [];
+  log.debug(`_scoreOne(pair=${pairIndex}) Model required inputs:`, requiredInputs);
+  log.debug(`_scoreOne(pair=${pairIndex}) inputIds length: ${inputIds.length}, first 5 IDs:`, inputIds.slice(0, 5));
+  log.debug(`_scoreOne(pair=${pairIndex}) chunk text sample (first 50 chars):`, chunkText.slice(0, 50));
+
   const feeds = {
     input_ids:      toInt64Buffer(inputIds),
     attention_mask: toInt64Buffer(attentionMask),
     token_type_ids: toInt64Buffer(tokenTypeIds),
   };
 
+  log.debug(`_scoreOne(pair=${pairIndex}) feeds keys:`, Object.keys(feeds));
+  // Log sizes of each feed buffer
+  for (const [key, buf] of Object.entries(feeds)) {
+    log.debug(`_scoreOne(pair=${pairIndex}) feed ${key} byteLength:`, buf.byteLength);
+  }
+
   const results = _session.runAsync
     ? await _session.runAsync(feeds)
     : _session.run(feeds);
 
-  // react-native-nitro-onnxruntime: outputNames is string[], not {name}[]
-  const outputKey = _session.outputNames?.[0] ?? 'logits';
+  // ── DEBUG: inspect raw outputs ──
+  log.debug(`_scoreOne(pair=${pairIndex}) Results keys:`, Object.keys(results));
+  const firstKey = Object.keys(results)[0];
+  const firstBuffer = results[firstKey];
+  if (firstBuffer) {
+    const firstFloat = new Float32Array(firstBuffer);
+    log.debug(`_scoreOne(pair=${pairIndex}) Output "${firstKey}" length: ${firstFloat.length}, values:`, Array.from(firstFloat).slice(0, 5));
+  }
+
+  // FIX: Handle both string array and {name: string} array formats
+  let outputKey = 'logits'; // default
+  if (_session.outputNames && _session.outputNames.length > 0) {
+    const firstName = _session.outputNames[0];
+    if (typeof firstName === 'string') {
+      outputKey = firstName;
+    } else if (firstName && typeof firstName === 'object' && firstName.name) {
+      outputKey = firstName.name;
+    }
+  }
 
   const rawBuffer = results[outputKey];
 
@@ -372,6 +435,10 @@ async function rerank(query, chunks) {
       scored.push({ ...chunk, rerankerScore: -Infinity });
     }
   }
+
+  // ── DEBUG: log the array of scores before sorting ──
+  log.debug('rerank() raw scores before sort:',
+    scored.map((c, idx) => `[${idx}] ${c.rerankerScore?.toFixed(4)}`).join(', '));
 
   scored.sort((a, b) => b.rerankerScore - a.rerankerScore);
 
