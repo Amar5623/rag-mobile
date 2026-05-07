@@ -7,9 +7,17 @@
 //
 // The old signature apiFetch(path, options) still works — if the second arg
 // is a plain object (options) the legacy behaviour is preserved.
+//
+// LOGGING ADDED: Every significant step in URL resolution and fetch lifecycle
+// is logged via createLogger('client') so the full request flow is visible in
+// the console from start to finish.
 
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Config }   from '../config';
+import { createLogger } from '../utils/logger';
+
+// Module-level logger — all lines from this file are tagged [client]
+const log = createLogger('client');
 
 export class ApiError extends Error {
   constructor(message, status) {
@@ -25,21 +33,33 @@ export class ApiError extends Error {
 let _cachedUrl = null;
 
 export async function getBaseUrl() {
-  if (_cachedUrl) return _cachedUrl;
+  if (_cachedUrl) {
+    log.debug('getBaseUrl() → cache hit:', _cachedUrl);
+    return _cachedUrl;
+  }
+
+  log.debug('getBaseUrl() → reading from AsyncStorage');
+
   // Prefer local_url (set by SettingsScreen new fields); fall back to legacy server_url
   const local  = await AsyncStorage.getItem('local_url');
   const legacy = await AsyncStorage.getItem('server_url');
+
   _cachedUrl = (local && local.trim())
     ? local.trim()
     : (legacy && legacy.trim())
       ? legacy.trim()
       : Config.API_BASE_URL;
+
+  log.info('getBaseUrl() resolved →', _cachedUrl,
+    `(local_url=${local || 'null'}, server_url=${legacy || 'null'})`);
+
   return _cachedUrl;
 }
 
 // Call this from SettingsScreen after saving a new URL so the next
 // request picks it up immediately.
 export function invalidateUrlCache() {
+  log.info('invalidateUrlCache() — clearing cached URL:', _cachedUrl);
   _cachedUrl = null;
 }
 
@@ -57,17 +77,29 @@ export async function apiFetch(path, activeUrlOrOptions, options = {}) {
 
   if (typeof activeUrlOrOptions === 'string') {
     // New signature: second arg is the active URL
+    log.debug(`apiFetch(${path}) — using provided activeUrl`);
     base = activeUrlOrOptions || await getBaseUrl();
     opts = options;
   } else {
     // Legacy signature: second arg is the options object
+    log.debug(`apiFetch(${path}) — legacy signature, reading base from storage`);
     base = await getBaseUrl();
     opts = activeUrlOrOptions || {};
   }
 
   const url        = `${base}${path}`;
   const controller = new AbortController();
-  const timeout    = setTimeout(() => controller.abort(), 30_000);
+  const timeout    = setTimeout(() => {
+    log.warn(`apiFetch(${path}) — 30s timeout reached, aborting`);
+    controller.abort();
+  }, 30_000);
+
+  log.info(`apiFetch → ${opts.method || 'GET'} ${url}`);
+  if (opts.body) {
+    log.debug(`apiFetch body:`, opts.body.slice?.(0, 200) ?? opts.body);
+  }
+
+  const startMs = Date.now();
 
   try {
     const res = await fetch(url, {
@@ -76,12 +108,20 @@ export async function apiFetch(path, activeUrlOrOptions, options = {}) {
       headers: { 'Content-Type': 'application/json', ...opts.headers },
     });
 
+    const elapsed = Date.now() - startMs;
+    log.info(`apiFetch ← ${res.status} ${res.statusText} (${elapsed}ms) [${path}]`);
+
     if (!res.ok) {
       const text = await res.text().catch(() => '');
+      log.error(`apiFetch ERROR ${res.status} for ${path}:`, text || `HTTP ${res.status}`);
       throw new ApiError(text || `HTTP ${res.status}`, res.status);
     }
 
     return res;
+  } catch (err) {
+    if (err instanceof ApiError) throw err; // already logged above
+    log.error(`apiFetch EXCEPTION for ${path}:`, err.message);
+    throw err;
   } finally {
     clearTimeout(timeout);
   }
