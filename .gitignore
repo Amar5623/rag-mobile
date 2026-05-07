@@ -39,3 +39,6 @@ yarn-error.*
 .expo/
 
 *.onnx
+# Native folders (CNG managed)
+/android
+/ios

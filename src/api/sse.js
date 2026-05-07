@@ -4,76 +4,120 @@
 // server URL from useNetwork.activeUrl can be used instead of the
 // hardcoded Config.API_BASE_URL. Falls back to Config.API_BASE_URL when
 // not provided (preserves backward compatibility).
+//
+// LOGGING ADDED: Every lifecycle event of the XHR SSE connection is logged
+// via createLogger('sse') — connection open, each onprogress chunk, each
+// parsed SSE event, [DONE] signal, errors, timeouts, and readyState changes.
 
 import { Config } from '../config';
+import { createLogger } from '../utils/logger';
+
+// Module-level logger — all lines tagged [sse]
+const log = createLogger('sse');
 
 export function streamSSE(path, body, onEvent, onDone, onError, baseUrl) {
   const base = baseUrl || Config.API_BASE_URL;
   const xhr  = new XMLHttpRequest();
   const url  = `${base}${path}`;
 
-  console.log('[SSE] Opening connection to:', url);
+  log.info('streamSSE() opening connection →', url);
+  log.debug('streamSSE() request body:', JSON.stringify(body).slice(0, 300));
 
   xhr.open('POST', url, true);
   xhr.setRequestHeader('Content-Type', 'application/json');
   xhr.setRequestHeader('Accept', 'text/event-stream');
 
-  let lastIndex = 0;
-  let buffer    = '';
+  let lastIndex     = 0;
+  let buffer        = '';
   let progressCount = 0;
+  let tokenCount    = 0;
+  const startMs     = Date.now();
 
+  // ── onprogress: fired every time new bytes arrive ────────────────────────
   xhr.onprogress = () => {
     progressCount++;
-    console.log(`[SSE] onprogress fired #${progressCount}, responseText length:`, xhr.responseText?.length);
+    log.debug(
+      `streamSSE onprogress #${progressCount}`,
+      `responseText.length=${xhr.responseText?.length}`,
+    );
 
     const newData = xhr.responseText.slice(lastIndex);
     lastIndex = xhr.responseText.length;
 
-    console.log('[SSE] new chunk raw:', JSON.stringify(newData.slice(0, 200)));
+    log.debug('streamSSE new chunk raw:', JSON.stringify(newData.slice(0, 200)));
 
     buffer += newData;
     const lines = buffer.split('\n');
-    buffer = lines.pop();
+    buffer = lines.pop(); // keep any incomplete line
 
     for (const line of lines) {
-      console.log('[SSE] line:', JSON.stringify(line));
+      log.debug('streamSSE line:', JSON.stringify(line));
+
       if (!line.startsWith('data: ')) continue;
       const raw = line.slice(6).trim();
-      if (raw === '[DONE]') { console.log('[SSE] got [DONE]'); onDone?.(); return; }
+
+      if (raw === '[DONE]') {
+        log.info('streamSSE received [DONE] after', Date.now() - startMs, 'ms,',
+          tokenCount, 'tokens streamed');
+        onDone?.();
+        return;
+      }
+
       try {
         const parsed = JSON.parse(raw);
-        console.log('[SSE] parsed event:', JSON.stringify(parsed));
+
+        // Count tokens for telemetry logging
+        if (parsed.token !== undefined) {
+          tokenCount++;
+          if (tokenCount === 1) {
+            log.info('streamSSE first token received — time-to-first-token:',
+              Date.now() - startMs, 'ms');
+          }
+        }
+
+        log.debug('streamSSE parsed event:', JSON.stringify(parsed).slice(0, 200));
         onEvent(parsed);
       } catch (e) {
-        console.log('[SSE] JSON parse error:', e.message, 'raw was:', raw);
+        log.warn('streamSSE JSON parse error:', e.message, '| raw was:', raw);
       }
     }
   };
 
+  // ── onload: fired when the request completes ────────────────────────────
   xhr.onload = () => {
-    console.log('[SSE] onload fired, status:', xhr.status);
-    console.log('[SSE] final responseText length:', xhr.responseText?.length);
-    console.log('[SSE] final responseText (first 500):', xhr.responseText?.slice(0, 500));
+    log.info('streamSSE onload fired — status:', xhr.status,
+      '| responseText.length:', xhr.responseText?.length,
+      '| elapsed:', Date.now() - startMs, 'ms');
+    log.debug('streamSSE final responseText (first 500):', xhr.responseText?.slice(0, 500));
     onDone?.();
   };
 
+  // ── onerror: network-level failure ───────────────────────────────────────
   xhr.onerror = (e) => {
-    console.log('[SSE] onerror:', e);
+    log.error('streamSSE onerror — network failure after', Date.now() - startMs, 'ms:', e);
     onError?.(new Error('SSE connection failed'));
   };
 
+  // ── ontimeout: exceeded xhr.timeout ──────────────────────────────────────
   xhr.ontimeout = () => {
-    console.log('[SSE] timeout fired');
+    log.error('streamSSE ontimeout — exceeded 60s after', Date.now() - startMs, 'ms');
     onError?.(new Error('SSE timeout'));
   };
 
+  // ── onreadystatechange: diagnostic — logs each state transition ──────────
   xhr.onreadystatechange = () => {
-    console.log('[SSE] readyState changed:', xhr.readyState, 'status:', xhr.status);
+    const states = ['UNSENT', 'OPENED', 'HEADERS_RECEIVED', 'LOADING', 'DONE'];
+    log.debug(
+      `streamSSE readyState → ${states[xhr.readyState] || xhr.readyState}`,
+      `(status=${xhr.status})`,
+    );
   };
 
-  xhr.timeout = 60000;
-  xhr.send(JSON.stringify(body));
+  // Set 60 s timeout (generous for large responses)
+  xhr.timeout = 60_000;
 
-  console.log('[SSE] request sent');
+  xhr.send(JSON.stringify(body));
+  log.info('streamSSE request sent to', url);
+
   return xhr;
 }
